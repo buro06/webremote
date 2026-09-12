@@ -199,19 +199,28 @@ port can pause your music. That's usually fine on a home LAN. Use `--token` if
 you want a shared secret in the URL, and don't port-forward this to the
 internet.
 
-## Polling
+## Updates
 
-The page asks for state once a second while something is playing, every four
-seconds when paused, and not at all while the tab is hidden or the phone is
-asleep - it polls immediately on becoming visible again. Successful state
-polls are filtered out of the server's console so they cannot bury real
-errors; every other request still logs.
+The server subscribes to the same media-session events that drive the Windows
+volume overlay, and the page asks `/api/state?since=<version>`, which the
+server holds open until one of those events fires (or four seconds pass, which
+is also how quickly a volume change made on the PC shows up). Play/pause,
+track and seek changes therefore appear as soon as the app reports them. The
+play/pause icon also flips the moment you tap it.
+
+The startup banner and `--check` say `events: live` when this is working. If
+the subscription fails the page falls back to polling: once a second while
+something is playing, every four seconds when paused. Either way it stops
+while the tab is hidden or the phone is asleep and refreshes immediately on
+becoming visible again. Successful state requests are filtered out of the
+server's console so they cannot bury real errors; every other request still
+logs.
 
 ## API
 
 | Method | Path | Body |
 | --- | --- | --- |
-| GET | `/api/state` | — |
+| GET | `/api/state` | — ; `?since=<version>` waits up to 4 s for a change |
 | POST | `/api/command` | `{"action": "playpause\|play\|pause\|next\|prev\|stop"}`, replies with `via` = which route worked |
 | POST | `/api/seek` | `{"position": 42.0}` (seconds) |
 | POST | `/api/volume` | `{"level": 40}` or `{"delta": -5}` or `{"mute": null}` (null toggles) |

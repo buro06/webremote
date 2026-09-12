@@ -198,6 +198,10 @@ PLAYBACK_STATUS = {
 _manager = None
 _art_cache: dict[str, bytes] = {}
 _art_lock = threading.Lock()
+# Which art key belongs to which track, so a state read does not reopen and
+# reread the whole thumbnail every time. Cleared when an app reports new media
+# properties, since the cover can arrive after the title does.
+_track_art: dict[tuple, str] = {}
 
 
 async def _get_manager():
@@ -205,6 +209,93 @@ async def _get_manager():
     if _manager is None:
         _manager = await asyncio.wait_for(MediaManager.request_async(), 5)
     return _manager
+
+
+class Changes:
+    """A counter the media-session events bump, so a request can wait on it.
+
+    Polling is why the page lagged behind the Windows volume overlay: the
+    overlay is told the moment an app reports a change, while the page only
+    found out on its next poll. Subscribing to the same events and holding
+    /api/state open until one fires gets the page the news just as fast.
+    """
+
+    def __init__(self) -> None:
+        self.version = 0
+        self.live = False  # True once the events are subscribed
+        self._cond = threading.Condition()
+
+    def bump(self, *_) -> None:
+        with self._cond:
+            self.version += 1
+            self._cond.notify_all()
+
+    def wait(self, since: int, timeout: float) -> int:
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self.version == since:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(remaining)
+            return self.version
+
+
+changes = Changes()
+_watched: list = []  # (session, [(event name, registration token)])
+SESSION_EVENTS = ("playback_info_changed", "media_properties_changed", "timeline_properties_changed")
+
+
+# Event handlers run on a WinRT thread-pool thread, not the worker, so they do
+# nothing but record the change and hand any WinRT work back to the worker.
+def _on_session_event(sender, args) -> None:
+    changes.bump()
+
+
+def _on_media_properties(sender, args) -> None:
+    _track_art.clear()
+    changes.bump()
+
+
+def _on_sessions_changed(sender, args) -> None:
+    changes.bump()
+    worker.loop.call_soon_threadsafe(_resubscribe)
+
+
+def _resubscribe() -> None:
+    """Listen to every registered session, dropping the ones we had before."""
+    for session, tokens in _watched:
+        for name, token in tokens:
+            try:
+                getattr(session, f"remove_{name}")(token)
+            except Exception:
+                pass  # the session has usually closed already
+    _watched.clear()
+
+    try:
+        sessions = list(_manager.get_sessions())
+    except Exception:
+        return
+    for session in sessions:
+        tokens = []
+        for name in SESSION_EVENTS:
+            handler = _on_media_properties if name == "media_properties_changed" else _on_session_event
+            try:
+                tokens.append((name, getattr(session, f"add_{name}")(handler)))
+            except Exception:
+                pass
+        _watched.append((session, tokens))
+
+
+async def watch_sessions() -> bool:
+    if not HAVE_WINRT:
+        return False
+    manager = await _get_manager()
+    manager.add_current_session_changed(_on_session_event)
+    manager.add_sessions_changed(_on_sessions_changed)
+    _resubscribe()
+    changes.live = True
+    return True
 
 
 def _session_rank(session) -> int:
@@ -337,6 +428,7 @@ def _cache_art(data: bytes | None) -> str | None:
             # keep the cache tiny; only recent covers matter
             if len(_art_cache) > 8:
                 _art_cache.clear()
+                _track_art.clear()
             _art_cache[key] = data
     return key
 
@@ -385,7 +477,15 @@ async def read_state() -> dict:
         state["title"] = props.title or None
         state["artist"] = props.artist or None
         state["album"] = props.album_title or None
-        state["art"] = _cache_art(await _thumbnail_bytes(props))
+        track = (state["app"], state["title"], state["artist"], state["album"])
+        state["art"] = _track_art.get(track)
+        if state["art"] is None:
+            # Only a found cover is remembered, so a late one still turns up.
+            state["art"] = _cache_art(await _thumbnail_bytes(props))
+            if state["art"] is not None:
+                if len(_track_art) > 8:
+                    _track_art.clear()
+                _track_art[track] = state["art"]
     except Exception:
         pass
 
@@ -586,9 +686,20 @@ TIMEOUT_STATE = {
 }
 
 
+HOLD_SECONDS = 4  # also bounds how stale a volume change made on the PC can get
+
+
 @app.get("/api/state")
 @protected
 def api_state():
+    # ?since=<version> holds the request until a media event fires, so the
+    # page hears about a change as soon as the app reports it.
+    since = request.args.get("since", type=int)
+    if since is not None and changes.live:
+        if changes.wait(since, HOLD_SECONDS) != since:
+            time.sleep(0.05)  # events arrive in bursts; let the rest land
+    version = changes.version  # before reading, so a change mid-read is not lost
+
     # A wedged media session must not take the whole page down: the phone is
     # still talking to the PC, so answer 200 and say what is wrong.
     try:
@@ -602,6 +713,8 @@ def api_state():
     except FutureTimeout:
         state["volume"] = {"available": False, "level": None, "muted": None}
     state["time"] = time.time()
+    state["version"] = version
+    state["live"] = changes.live
     return jsonify(state)
 
 
@@ -742,6 +855,11 @@ def main() -> int:
                     print(f'          reading: {who} - "{what}" [{state["status"]}]')
                 else:
                     print("          no app is currently registered as playing media")
+                try:
+                    worker.call(watch_sessions, timeout=8)
+                    print("  events: live - changes show immediately")
+                except Exception as exc:
+                    print(f"  events: FAILED, page will poll: {type(exc).__name__}: {exc}")
             except Exception as exc:
                 media_ok = False
                 print(f"          FAILED: {type(exc).__name__}: {exc}")
@@ -770,8 +888,15 @@ def main() -> int:
     app.config["TOKEN"] = args.token
 
     suffix = f"?t={args.token}" if args.token else ""
+    try:
+        live = worker.call(watch_sessions, timeout=8)
+        events_note = "live - changes show immediately" if live else "unavailable, polling instead"
+    except Exception as exc:
+        events_note = f"unavailable, polling instead ({type(exc).__name__}: {exc})"
+
     print("webremote")
     print(f"  media : {media_note}")
+    print(f"  events: {events_note}")
     print(f"  volume: {volume_note}")
     print(f"  com   : {worker.apartment} apartment")
     print()

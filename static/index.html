@@ -172,6 +172,7 @@
   let holdVolume = 0;
   let dragging = false;
   let localPos = 0, localPosAt = 0;
+  let pending = null;   // {from, until}: optimistic play/pause icon after a tap
 
   const setFill = (input, fraction) => {
     const pct = Math.max(0, Math.min(1, fraction || 0)) * 100;
@@ -190,22 +191,42 @@
     el.statusText.textContent = text;
   }
 
-  async function api(path, options) {
-    const res = await fetch(path + qs, Object.assign({ cache: 'no-store' }, options));
+  async function api(path, options, params) {
+    const query = new URLSearchParams(params || {});
+    if (token) query.set('t', token);
+    const url = path + (query.toString() ? '?' + query : '');
+    const res = await fetch(url, Object.assign({ cache: 'no-store' }, options));
     if (!res.ok) throw new Error(res.status === 401 ? 'unauthorized' : 'http ' + res.status);
     return res.json();
   }
 
+  function showPlaying(playing) {
+    el.iconPlay.classList.toggle('hide', playing);
+    el.iconPause.classList.toggle('hide', !playing);
+  }
+
   async function send(action) {
+    // Flip the icon now rather than after the app gets round to reporting it;
+    // render() keeps it flipped until the real status catches up.
+    if (action === 'playpause' && state) {
+      pending = { from: state.status, until: Date.now() + 2500 };
+      showPlaying(state.status !== 'playing');
+    }
     try {
-      await api('/api/command', {
+      const data = await api('/api/command', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action })
       });
-      // players report their new state a beat after acting on the command
-      [120, 400, 900].forEach(d => setTimeout(tick, d));
-    } catch (e) { setConnection(false, 'disconnected'); }
+      if (!data.ok && pending) { pending = null; if (state) render(state); }
+      // Live updates bring the new state as soon as the app reports it.
+      // Without them, look again a few times while the app catches up.
+      if (!(state && state.live)) [150, 500, 1000, 2000].forEach(d => setTimeout(tick, d));
+    } catch (e) {
+      pending = null;
+      if (state) render(state);
+      setConnection(false, 'disconnected');
+    }
   }
 
   async function volume(payload) {
@@ -237,9 +258,12 @@
 
   function render(s) {
     state = s;
-    const playing = s.status === 'playing';
-    el.iconPlay.classList.toggle('hide', playing);
-    el.iconPause.classList.toggle('hide', !playing);
+    // A reading that still shows the status from before the tap is just the
+    // app being slow, so it does not undo the flipped icon.
+    if (pending && ((s.status !== pending.from && s.status !== 'changing') || Date.now() > pending.until)) {
+      pending = null;
+    }
+    if (!pending) showPlaying(s.status === 'playing');
 
     el.title.textContent = s.title || (s.available ? 'Unknown track' : 'Nothing playing');
     el.artist.textContent = s.artist || s.album || '—';
@@ -297,16 +321,25 @@
   }, 500);
 
   async function poll() {
+    // With live updates the server holds this request until something
+    // changes. The abort covers a request frozen while the phone slept.
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 12000);
+    const params = state && state.live && state.version != null ? { since: state.version } : null;
     try {
-      const s = await api('/api/state');
+      const s = await api('/api/state', { signal: abort.signal }, params);
       failures = 0;
       setConnection(true, 'connected');
       render(s);
       renderVolume(s.volume);
+      return true;
     } catch (e) {
       if (++failures >= 2) {
         setConnection(false, e.message === 'unauthorized' ? 'unauthorized' : 'disconnected');
       }
+      return false;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -341,18 +374,21 @@
   });
   el.vol.addEventListener('change', () => { dragging = false; volume({ level: +el.vol.value }); });
 
-  // Poll only as fast as the state can change, and not at all while the phone
-  // is asleep or the tab is in the background.
+  // One request at a time, and none while the phone is asleep or the tab is in
+  // the background. With live updates the next request goes straight out and
+  // waits on the server; without them, poll only as fast as the state changes.
   let pollTimer = null;
-  function schedule() {
+  let polling = false;
+  async function tick() {
     clearTimeout(pollTimer);
+    if (polling || document.hidden) return;
+    polling = true;
+    let ok;
+    try { ok = await poll(); } finally { polling = false; }
     if (document.hidden) return;
     const playing = state && state.status === 'playing';
-    pollTimer = setTimeout(tick, playing ? 1000 : 4000);
-  }
-  async function tick() {
-    await poll();
-    schedule();
+    const delay = !ok ? 2000 : state.live ? 0 : playing ? 1000 : 4000;
+    pollTimer = setTimeout(tick, delay);
   }
 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
