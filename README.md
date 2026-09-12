@@ -67,24 +67,39 @@ bindings are compiled C++ extensions with a limited range of wheels:
 | `winsdk` | Python 3.8 - 3.12 |
 | `winrt-Windows.Media.Control` (successor) | Python 3.9 - 3.13 |
 
-So on Python 3.14 neither one installs without a compiler. Pick one:
+So on Python 3.14 neither one installs without a compiler.
 
-1. **Install Python 3.13** (or 3.12) alongside your current one and build the
-   venv with it - this gets you full track info:
-   ```
-   py -3.13 -m venv .venv
-   .venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt
-   ```
-2. **Skip the extras.** The remote works without them, just in media-key mode:
-   buttons control whatever is playing, but no title/artist/art/seek.
-   ```
-   pip install flask
-   python webremote.py
-   ```
+**`run.bat` handles this for you.** It looks for a Python between 3.9 and 3.13,
+and if 3.14 is all you have it explains the tradeoff and offers to install
+Python 3.13 via winget and build the environment with that instead:
 
-Always add `--only-binary=:all:` to pip installs here. It makes pip fail fast
-with "no matching distribution" instead of trying to invoke a compiler.
-`run.bat` does this for you and falls back to a core-only install.
+```
+  The only Python installed is Python 3.14.0.
+
+    [1]  Install Python 3.13 and use it  -  recommended, full features
+    [2]  Continue with Python 3.14.0  -  buttons work, no track info
+    [3]  Exit
+```
+
+It offers the same choice when an existing `.venv` turns out to be media-key
+only, in which case option 1 rebuilds it. To do it by hand instead:
+
+```
+py -3.13 -m venv .venv
+.venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt
+```
+
+Always pass `--only-binary=:all:` when installing by hand. It makes pip fail
+fast with "no matching distribution" instead of trying to invoke a compiler.
+
+To see what an environment supports without starting the server:
+
+```
+.venv\Scripts\python.exe webremote.py --check
+```
+
+It prints the media and volume backends and exits 0 for full features, 1 for
+media-key mode.
 
 ## Degraded modes
 

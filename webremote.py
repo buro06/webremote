@@ -462,13 +462,25 @@ def local_ip() -> str:
         sock.close()
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--host", default="0.0.0.0", help="interface to bind (default: all)")
     parser.add_argument("--port", type=int, default=8765, help="port (default: 8765)")
     parser.add_argument("--token", nargs="?", const="generate", default=None,
                         help="require ?t=TOKEN; pass the flag alone to generate one")
+    parser.add_argument("--check", action="store_true",
+                        help="report what this environment supports and exit; "
+                             "exit code 0 = full features, 1 = media keys only")
     args = parser.parse_args()
+
+    media_note = f"Windows media session (via {BINDING})" if HAVE_WINRT else \
+        "media keys only - no track info (see README: 'No wheel for your Python')"
+    volume_note = "system master volume" if HAVE_PYCAW else "media keys only (pycaw not installed)"
+
+    if args.check:
+        print(f"  media : {media_note}")
+        print(f"  volume: {volume_note}")
+        return 0 if HAVE_WINRT else 1
 
     if args.token == "generate":
         args.token = secrets.token_urlsafe(8)
@@ -476,10 +488,8 @@ def main() -> None:
 
     suffix = f"?t={args.token}" if args.token else ""
     print("webremote")
-    media_note = f"Windows media session (via {BINDING})" if HAVE_WINRT else \
-        "media keys only - no track info (see README: 'No wheel for your Python')"
     print(f"  media : {media_note}")
-    print(f"  volume: {'system master volume' if HAVE_PYCAW else 'media keys only (pycaw not installed)'}")
+    print(f"  volume: {volume_note}")
     print()
     print(f"  local : http://127.0.0.1:{args.port}/{suffix}")
     print(f"  phone : http://{local_ip()}:{args.port}/{suffix}")
@@ -487,7 +497,8 @@ def main() -> None:
     print("  Ctrl+C to stop.")
 
     app.run(host=args.host, port=args.port, threaded=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
