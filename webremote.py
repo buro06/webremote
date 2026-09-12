@@ -22,6 +22,7 @@ import hashlib
 import inspect
 import os
 import secrets
+import logging
 import socket
 import sys
 import threading
@@ -46,6 +47,8 @@ IS_WINDOWS = sys.platform == "win32"
 # its types depend on, and the import then fails at runtime.
 MEDIA_FIX = 'pip install --only-binary=:all: "winrt-Windows.Media.Control[all]"'
 VOLUME_FIX = "pip install --only-binary=:all: pycaw"
+
+FORCE_MEDIA_KEYS = False  # set by --media-keys
 
 MediaManager = Buffer = DataReader = InputStreamOptions = None
 BINDING = None
@@ -253,6 +256,53 @@ async def _current_session():
     return best
 
 
+async def list_sessions() -> list:
+    """Every registered session and what it claims to support.
+
+    Apps vary wildly in how much of the media-session contract they implement,
+    so when a button does nothing this is the first thing to look at.
+    """
+    rows = []
+    try:
+        manager = await _get_manager()
+        current = manager.get_current_session()
+        current_id = getattr(current, "source_app_user_model_id", None)
+        for session in manager.get_sessions():
+            row = {"app": "?", "status": "?", "current": False, "title": None,
+                   "controls": {}, "duration": None}
+            try:
+                row["app"] = session.source_app_user_model_id
+                row["current"] = row["app"] == current_id
+            except Exception:
+                pass
+            try:
+                info = session.get_playback_info()
+                row["status"] = PLAYBACK_STATUS.get(int(info.playback_status), "?")
+                c = info.controls
+                row["controls"] = {
+                    "play": bool(c.is_play_enabled),
+                    "pause": bool(c.is_pause_enabled),
+                    "next": bool(c.is_next_enabled),
+                    "prev": bool(c.is_previous_enabled),
+                    "seek": bool(c.is_playback_position_enabled),
+                }
+            except Exception:
+                pass
+            try:
+                props = await asyncio.wait_for(session.try_get_media_properties_async(), 3)
+                row["title"] = props.title or None
+            except Exception:
+                pass
+            try:
+                row["duration"] = round(session.get_timeline_properties().end_time.total_seconds(), 1)
+            except Exception:
+                pass
+            rows.append(row)
+    except Exception:
+        pass
+    return rows
+
+
 async def _session_count() -> int:
     try:
         manager = await _get_manager()
@@ -362,26 +412,38 @@ async def read_state() -> dict:
     return state
 
 
-async def do_command(action: str) -> bool:
-    """Transport control. Prefers the media session, falls back to media keys."""
-    session = await _current_session()
+async def do_command(action: str) -> str | None:
+    """Transport control. Returns which route worked, or None if neither did.
+
+    Prefers the media session, since it addresses one specific app. Media keys
+    go to whatever Windows decides, which is a blunter instrument but reaches
+    apps whose session ignores commands.
+    """
+    session = None if FORCE_MEDIA_KEYS else await _current_session()
     if session is not None:
         try:
-            calls = {
-                "playpause": session.try_toggle_play_pause_async,
-                "play": session.try_play_async,
-                "pause": session.try_pause_async,
-                "next": session.try_skip_next_async,
-                "prev": session.try_skip_previous_async,
-                "stop": session.try_stop_async,
-            }
-            if action in calls and await calls[action]():
-                return True
+            # An explicit play/pause is honoured by more apps than the toggle,
+            # so aim for the state we want and keep the toggle as a backup.
+            if action == "playpause":
+                playing = int(session.get_playback_info().playback_status) == 4
+                attempts = [session.try_pause_async if playing else session.try_play_async,
+                            session.try_toggle_play_pause_async]
+            else:
+                attempts = [{
+                    "play": session.try_play_async,
+                    "pause": session.try_pause_async,
+                    "next": session.try_skip_next_async,
+                    "prev": session.try_skip_previous_async,
+                    "stop": session.try_stop_async,
+                }[action]]
+            for attempt in attempts:
+                if await asyncio.wait_for(attempt(), 4):
+                    return "session"
         except Exception:
             pass
 
     key = {"play": "playpause", "pause": "playpause"}.get(action, action)
-    return tap_key(key)
+    return "mediakey" if tap_key(key) else None
 
 
 async def do_seek(seconds: float) -> bool:
@@ -550,7 +612,8 @@ def api_command():
     if action not in {"playpause", "play", "pause", "next", "prev", "stop"}:
         return jsonify({"ok": False, "error": "unknown action"}), 400
     try:
-        return jsonify({"ok": bool(worker.call(do_command, action))})
+        via = worker.call(do_command, action)
+        return jsonify({"ok": via is not None, "via": via})
     except FutureTimeout:
         return jsonify({"ok": False, "error": "timed out"})
 
@@ -587,6 +650,15 @@ def api_volume():
         return jsonify({"ok": False, "error": "timed out"})
 
 
+@app.get("/api/sessions")
+@protected
+def api_sessions():
+    try:
+        return jsonify({"sessions": worker.call(list_sessions, timeout=10)})
+    except FutureTimeout:
+        return jsonify({"sessions": [], "error": "timed out"})
+
+
 @app.get("/api/art/<key>")
 @protected
 def api_art(key):
@@ -595,6 +667,14 @@ def api_art(key):
     if not data:
         abort(404)
     return app.response_class(data, mimetype="image/jpeg", headers={"Cache-Control": "max-age=3600"})
+
+
+class _QuietPolls(logging.Filter):
+    """Keep successful state polls out of the console without hiding errors."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not ("/api/state" in message and " 200 " in message)
 
 
 def local_ip() -> str:
@@ -614,10 +694,16 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8765, help="port (default: 8765)")
     parser.add_argument("--token", nargs="?", const="generate", default=None,
                         help="require ?t=TOKEN; pass the flag alone to generate one")
+    parser.add_argument("--media-keys", action="store_true",
+                        help="always drive playback with virtual media keys instead of "
+                             "the media session; for apps whose session ignores commands")
     parser.add_argument("--check", action="store_true",
                         help="report what this environment supports and exit; "
                              "exit code 0 = full features, 1 = media keys only")
     args = parser.parse_args()
+
+    global FORCE_MEDIA_KEYS
+    FORCE_MEDIA_KEYS = args.media_keys
 
     media_note = f"Windows media session (via {BINDING})" if HAVE_WINRT else \
         "media keys only - no track info (see README: 'No wheel for your Python')"
@@ -639,8 +725,17 @@ def main() -> int:
         if HAVE_WINRT:
             try:
                 state = worker.call(read_state, timeout=10)
-                count = worker.call(_session_count, timeout=10)
-                print(f"          {count} media session(s) registered")
+                rows = worker.call(list_sessions, timeout=15)
+                print(f"          {len(rows)} media session(s) registered")
+                for row in rows:
+                    flags = "".join(k[0] if v else "-" for k, v in sorted(row["controls"].items()))
+                    marker = "*" if row["current"] else " "
+                    title = row["title"] or "no title"
+                    print(f'         {marker} {row["app"]}  [{row["status"]}] '
+                          f'{flags}  dur={row["duration"]}  "{title}"')
+                if rows:
+                    print("           * = the session Windows calls current; flags are")
+                    print("             next/pause/play/prev/seek, letter = supported")
                 if state["available"]:
                     who = state["app"] or "unknown app"
                     what = state["title"] or "no title reported"
@@ -684,6 +779,7 @@ def main() -> int:
     print(f"  phone : http://{local_ip()}:{args.port}/{suffix}")
     print()
     print("  Ctrl+C to stop.")
+    logging.getLogger("werkzeug").addFilter(_QuietPolls())
 
     app.run(host=args.host, port=args.port, threaded=True)
     return 0

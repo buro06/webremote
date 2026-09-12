@@ -46,6 +46,7 @@ python webremote.py --port 9000     # different port
 python webremote.py --host 127.0.0.1  # local only
 python webremote.py --token         # generate a token; URL becomes .../?t=XXXX
 python webremote.py --token mysecret
+python webremote.py --media-keys    # drive playback with media keys only
 ```
 
 ### First-run notes
@@ -83,6 +84,34 @@ hangs until it times out. Report it - there is no user-side workaround.
 
 Harmless. Those warnings come from transitive `winrt-*` packages that have no
 `all` extra of their own; the packages still install correctly.
+
+### A button does nothing in one particular app
+
+Run `--check` and look at the session table it prints:
+
+```
+  media : Windows media session (via winrt)
+          2 media session(s) registered
+        * firefox.exe  [playing] n-p-s  dur=0.0  "Song Title"
+          Spotify.exe  [paused]  nppps  dur=214.0  "Other Song"
+           * = the session Windows calls current; flags are
+             next/pause/play/prev/seek, letter = supported
+```
+
+Each flag is the first letter of a control the app says it supports, or `-`
+if it does not. An app advertising `-` for pause has told Windows it will not
+honour a pause command, and the remote cannot make it.
+
+When the session route is refused, try the blunt instrument:
+
+```
+python webremote.py --media-keys
+```
+
+That skips the media session for playback and sends virtual media keys
+instead, which Windows routes by its own rules. Track info still comes from
+the session. Firefox in particular needs `media.hardwaremediakeys.enabled`
+set to true in `about:config` for either route to reach it.
 
 ### Track info appears for one app but not another
 
@@ -170,12 +199,21 @@ port can pause your music. That's usually fine on a home LAN. Use `--token` if
 you want a shared secret in the URL, and don't port-forward this to the
 internet.
 
+## Polling
+
+The page asks for state once a second while something is playing, every four
+seconds when paused, and not at all while the tab is hidden or the phone is
+asleep - it polls immediately on becoming visible again. Successful state
+polls are filtered out of the server's console so they cannot bury real
+errors; every other request still logs.
+
 ## API
 
 | Method | Path | Body |
 | --- | --- | --- |
 | GET | `/api/state` | — |
-| POST | `/api/command` | `{"action": "playpause\|play\|pause\|next\|prev\|stop"}` |
+| POST | `/api/command` | `{"action": "playpause\|play\|pause\|next\|prev\|stop"}`, replies with `via` = which route worked |
 | POST | `/api/seek` | `{"position": 42.0}` (seconds) |
 | POST | `/api/volume` | `{"level": 40}` or `{"delta": -5}` or `{"mute": null}` (null toggles) |
+| GET | `/api/sessions` | every registered media session and its advertised controls |
 | GET | `/api/art/<key>` | album art JPEG, key from `/api/state` |

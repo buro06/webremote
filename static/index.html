@@ -60,8 +60,20 @@
   input[type=range] {
     -webkit-appearance: none; appearance: none; width: 100%; background: transparent; margin: 14px 0 0; height: 22px;
   }
-  input[type=range]::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: var(--panel-hi); }
-  input[type=range]::-moz-range-track { height: 6px; border-radius: 3px; background: var(--panel-hi); }
+  input[type=range] { --pct: 0%; }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 6px; border-radius: 3px;
+    background: linear-gradient(var(--accent), var(--accent)) left/var(--pct) 100% no-repeat, var(--panel-hi);
+  }
+  input[type=range]::-moz-range-track {
+    height: 6px; border-radius: 3px;
+    background: linear-gradient(var(--accent), var(--accent)) left/var(--pct) 100% no-repeat, var(--panel-hi);
+  }
+  /* Plenty of players report a position but refuse seeks. Keep showing the
+     progress in that case - only the grab handle goes away. */
+  input[type=range].readonly { pointer-events: none; }
+  input[type=range].readonly::-webkit-slider-thumb { opacity: 0; }
+  input[type=range].readonly::-moz-range-thumb { opacity: 0; }
   input[type=range]::-webkit-slider-thumb {
     -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--text);
     margin-top: -6px; border: none;
@@ -161,6 +173,11 @@
   let dragging = false;
   let localPos = 0, localPosAt = 0;
 
+  const setFill = (input, fraction) => {
+    const pct = Math.max(0, Math.min(1, fraction || 0)) * 100;
+    input.style.setProperty('--pct', pct.toFixed(2) + '%');
+  };
+
   const fmt = s => {
     if (s == null || !isFinite(s)) return '0:00';
     s = Math.max(0, Math.round(s));
@@ -187,7 +204,7 @@
         body: JSON.stringify({ action })
       });
       // players report their new state a beat after acting on the command
-      [120, 400, 900].forEach(d => setTimeout(poll, d));
+      [120, 400, 900].forEach(d => setTimeout(tick, d));
     } catch (e) { setConnection(false, 'disconnected'); }
   }
 
@@ -208,7 +225,7 @@
     const on = v && v.available;
     el.vol.disabled = !on;
     if (on) {
-      if (!dragging) el.vol.value = v.level;
+      if (!dragging) { el.vol.value = v.level; setFill(el.vol, v.level / 100); }
       el.volValue.textContent = v.muted ? 'muted' : v.level + '%';
       el.volValue.classList.toggle('muted-on', !!v.muted);
       el.iconVol.classList.toggle('hide', !!v.muted);
@@ -241,10 +258,12 @@
     el.next.disabled = s.available && !c.next;
     el.playpause.disabled = s.available && !c.play && !c.pause;
 
-    const seekable = s.duration != null && c.seek;
-    el.seek.disabled = !seekable;
+    // Show progress whenever we know the position; allow dragging only when
+    // the player says it accepts a seek.
+    el.seek.classList.toggle('readonly', !(s.duration != null && c.seek));
     el.dur.textContent = fmt(s.duration);
     if (s.duration != null) el.seek.max = s.duration;
+    if (s.duration == null) setFill(el.seek, 0);
 
     if (Date.now() > holdSeek && s.position != null) {
       localPos = s.position;
@@ -252,6 +271,7 @@
       if (!dragging) {
         el.seek.value = s.position;
         el.pos.textContent = fmt(s.position);
+        setFill(el.seek, s.duration ? s.position / s.duration : 0);
       }
     } else if (s.position == null) {
       el.pos.textContent = '0:00';
@@ -268,10 +288,12 @@
 
   // smooth the progress bar between polls
   setInterval(() => {
+    if (document.hidden) return;
     if (!state || state.status !== 'playing' || dragging || state.duration == null) return;
     const p = Math.min(state.duration, localPos + (Date.now() - localPosAt) / 1000);
     el.seek.value = p;
     el.pos.textContent = fmt(p);
+    setFill(el.seek, p / state.duration);
   }, 500);
 
   async function poll() {
@@ -297,7 +319,10 @@
     el.seek.addEventListener(ev, () => { dragging = true; }, { passive: true });
     el.vol.addEventListener(ev, () => { dragging = true; }, { passive: true });
   });
-  el.seek.addEventListener('input', () => { el.pos.textContent = fmt(+el.seek.value); });
+  el.seek.addEventListener('input', () => {
+    el.pos.textContent = fmt(+el.seek.value);
+    setFill(el.seek, +el.seek.value / (+el.seek.max || 1));
+  });
   el.seek.addEventListener('change', async () => {
     dragging = false;
     holdSeek = Date.now() + 1200;
@@ -310,13 +335,29 @@
       });
     } catch (e) { setConnection(false, 'disconnected'); }
   });
-  el.vol.addEventListener('input', () => { el.volValue.textContent = el.vol.value + '%'; });
+  el.vol.addEventListener('input', () => {
+    el.volValue.textContent = el.vol.value + '%';
+    setFill(el.vol, +el.vol.value / 100);
+  });
   el.vol.addEventListener('change', () => { dragging = false; volume({ level: +el.vol.value }); });
 
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+  // Poll only as fast as the state can change, and not at all while the phone
+  // is asleep or the tab is in the background.
+  let pollTimer = null;
+  function schedule() {
+    clearTimeout(pollTimer);
+    if (document.hidden) return;
+    const playing = state && state.status === 'playing';
+    pollTimer = setTimeout(tick, playing ? 1000 : 4000);
+  }
+  async function tick() {
+    await poll();
+    schedule();
+  }
 
-  poll();
-  setInterval(poll, 1000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+
+  tick();
 })();
 </script>
 </body>
