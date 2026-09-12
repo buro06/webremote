@@ -36,11 +36,19 @@ IS_WINDOWS = sys.platform == "win32"
 # optional dependencies
 # --------------------------------------------------------------------------
 # The Windows media-session bindings ship under two different distributions:
-#   winsdk                        - wheels for Python <= 3.12
-#   winrt-Windows.Media.Control   - the maintained successor, wheels for 3.13
+#   winsdk                            - wheels for Python <= 3.12
+#   winrt-Windows.Media.Control[all]  - the successor, wheels for 3.13
 # The APIs we use are identical, so accept whichever one is installed.
+#
+# The [all] extra matters: a bare winrt-Windows.Media.Control pulls in only
+# winrt-runtime, leaving out the Windows.Foundation / Windows.Media packages
+# its types depend on, and the import then fails at runtime.
+MEDIA_FIX = 'pip install --only-binary=:all: "winrt-Windows.Media.Control[all]"'
+VOLUME_FIX = "pip install --only-binary=:all: pycaw"
+
 MediaManager = Buffer = DataReader = InputStreamOptions = None
 BINDING = None
+BINDING_ERRORS = []
 
 for _package in ("winsdk", "winrt"):
     try:
@@ -52,11 +60,12 @@ for _package in ("winsdk", "winrt"):
         InputStreamOptions = _streams.InputStreamOptions
         BINDING = _package
         break
-    except Exception:  # not installed, or not on Windows
-        continue
+    except Exception as exc:  # not installed, incomplete install, or not Windows
+        BINDING_ERRORS.append(f"{_package}: {type(exc).__name__}: {exc}")
 
 HAVE_WINRT = BINDING is not None
 
+PYCAW_ERROR = None
 try:
     from ctypes import POINTER, cast as ctypes_cast
 
@@ -64,8 +73,9 @@ try:
     from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
     HAVE_PYCAW = True
-except Exception:  # pragma: no cover
+except Exception as exc:  # pragma: no cover
     HAVE_PYCAW = False
+    PYCAW_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 # --------------------------------------------------------------------------
@@ -478,9 +488,18 @@ def main() -> int:
     volume_note = "system master volume" if HAVE_PYCAW else "media keys only (pycaw not installed)"
 
     if args.check:
+        print(f"  python: {sys.version.split()[0]} on {sys.platform}")
         print(f"  media : {media_note}")
+        for line in BINDING_ERRORS:
+            print(f"          tried {line}")
+        if not HAVE_WINRT and IS_WINDOWS:
+            print(f"          fix:   {MEDIA_FIX}")
         print(f"  volume: {volume_note}")
-        return 0 if HAVE_WINRT else 1
+        if PYCAW_ERROR:
+            print(f"          tried pycaw: {PYCAW_ERROR}")
+            if IS_WINDOWS:
+                print(f"          fix:   {VOLUME_FIX}")
+        return 0 if (HAVE_WINRT and HAVE_PYCAW) else 1
 
     if args.token == "generate":
         args.token = secrets.token_urlsafe(8)

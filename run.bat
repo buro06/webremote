@@ -2,10 +2,10 @@
 REM ===========================================================================
 REM  webremote launcher
 REM
-REM  Finds a usable Python, builds a virtual environment, and starts the
-REM  server. The media-session bindings that provide track info are compiled
-REM  extensions with no Python 3.14 builds, so if 3.14 is all that is
-REM  installed this script offers to fetch Python 3.13 and use that instead.
+REM  Finds a usable Python, builds or repairs the virtual environment, and
+REM  starts the server. The media-session bindings that supply track info are
+REM  compiled extensions with no Python 3.14 builds, so on a 3.14-only machine
+REM  this script offers to fetch Python 3.13 and use that instead.
 REM ===========================================================================
 setlocal
 cd /d "%~dp0"
@@ -27,28 +27,49 @@ REM ------------------------------------------------------------ first run --
 :first_run
 call :find_good_python
 if defined GOODPY goto :build_env
-
 call :find_any_python
 if not defined ANYPY goto :no_python
 goto :menu_new
 
 
-REM --------------------------------------------------- an env already ex. --
+REM ------------------------------------------- an environment already ex. --
 :have_venv
 "%VENVPY%" webremote.py --check
 if not errorlevel 1 goto :launch
 
 echo.
 echo   ------------------------------------------------------------------
-echo    This environment can control playback, but cannot read track info.
+echo    This environment is missing an optional feature - see above.
 echo   ------------------------------------------------------------------
 echo.
+
+REM Can the venv's own Python take these packages, or is it too new?
+"%VENVPY%" -c "import sys; raise SystemExit(0 if (3,9) <= sys.version_info < (3,14) else 1)"
+if not errorlevel 1 goto :menu_repair
+
 call :find_good_python
 if defined GOODPY goto :menu_rebuild
 goto :menu_existing
 
 
 REM ------------------------------------------------------------- menus -----
+:menu_repair
+echo   The Python in this environment can run the missing pieces - they just
+echo   are not installed. Installing them needs no rebuild and no compiler.
+echo.
+echo     [1]  Install the missing pieces  -  recommended
+echo     [2]  Start anyway
+echo     [3]  Exit
+echo.
+set "ANS="
+set /p "ANS=   Choose [1/2/3]: "
+if "%ANS%"=="1" goto :install_deps
+if "%ANS%"=="2" goto :launch
+if "%ANS%"=="3" goto :bye
+echo   Please type 1, 2 or 3.
+echo.
+goto :menu_repair
+
 :menu_new
 echo   The only Python installed is %ANYLABEL%.
 echo.
@@ -67,10 +88,10 @@ echo.
 goto :menu_new
 
 :menu_rebuild
-echo   Good news: %GOODLABEL% is installed and does support track info.
+echo   %GOODLABEL% is installed and does support the missing features.
 echo.
 echo     [1]  Rebuild the environment with it  -  recommended
-echo     [2]  Start anyway, without track info
+echo     [2]  Start anyway
 echo     [3]  Exit
 echo.
 set "ANS="
@@ -85,7 +106,7 @@ goto :menu_rebuild
 :menu_existing
 call :explain
 echo     [1]  Install Python 3.13 and rebuild  -  recommended, full features
-echo     [2]  Start anyway, without track info
+echo     [2]  Start anyway
 echo     [3]  Exit
 echo.
 set "ANS="
@@ -133,9 +154,9 @@ pause
 exit /b 1
 
 :no_winget
-echo   winget is not available on this system, so I cannot install it for you.
+echo   winget is not available here, so I cannot install Python for you.
 echo.
-echo   Download Python 3.13 here, install it, then run run.bat again:
+echo   Download Python 3.13, install it, then run run.bat again:
 echo     https://www.python.org/downloads/
 echo.
 echo   Tick "Add python.exe to PATH" in the installer.
@@ -156,6 +177,7 @@ set "BUILDLABEL=%ANYLABEL%"
 goto :do_build
 
 :do_build
+echo.
 if not exist ".venv" goto :make_venv
 echo   Removing the old environment...
 rmdir /s /q ".venv"
@@ -164,21 +186,42 @@ rmdir /s /q ".venv"
 echo   Creating environment with %BUILDLABEL% ...
 %BUILDWITH% -m venv .venv
 if errorlevel 1 goto :error
+goto :install_deps
 
-echo   Installing dependencies...
+
+REM --------------------------------------------------------- dependencies --
+REM Installed in stages, deliberately. --only-binary=:all: keeps pip from ever
+REM invoking a compiler, and separate commands mean one unavailable extra
+REM cannot take the others down with it.
+:install_deps
 "%VENVPY%" -m pip install --upgrade pip >nul 2>&1
 
-REM --only-binary=:all: keeps pip from ever invoking a compiler, so a missing
-REM wheel degrades gracefully instead of demanding Visual Studio.
-"%VENVPY%" -m pip install --only-binary=:all: -r requirements.txt
-if not errorlevel 1 goto :launch
+echo.
+echo   [1/3] core...
+"%VENVPY%" -m pip install --only-binary=:all: --quiet flask
+if errorlevel 1 goto :error
+
+echo   [2/3] media session bindings, for track info...
+"%VENVPY%" -c "import sys; raise SystemExit(0 if sys.version_info < (3,13) else 1)"
+if errorlevel 1 goto :media_winrt
+"%VENVPY%" -m pip install --only-binary=:all: --quiet winsdk
+goto :after_media
+
+:media_winrt
+REM The [all] extra pulls in Windows.Foundation and Windows.Media, without
+REM which the control module cannot be imported at all.
+"%VENVPY%" -m pip install --only-binary=:all: --quiet "winrt-Windows.Media.Control[all]"
+
+:after_media
+if errorlevel 1 echo         ...unavailable here - the remote will run without track info.
+
+echo   [3/3] system volume...
+"%VENVPY%" -m pip install --only-binary=:all: --quiet pycaw comtypes
+if errorlevel 1 echo         ...unavailable here - the volume slider will be disabled.
 
 echo.
-echo   An optional extra had no prebuilt wheel here. Installing the core only;
-echo   the remote will run in media-key mode.
-echo.
-"%VENVPY%" -m pip install flask
-if errorlevel 1 goto :error
+echo   Environment ready:
+"%VENVPY%" webremote.py --check
 goto :launch
 
 
