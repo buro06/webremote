@@ -199,8 +199,7 @@ _manager = None
 _art_cache: dict[str, bytes] = {}
 _art_lock = threading.Lock()
 # Which art key belongs to which track, so a state read does not reopen and
-# reread the whole thumbnail every time. Cleared when an app reports new media
-# properties, since the cover can arrive after the title does.
+# reread the whole thumbnail every time.
 _track_art: dict[tuple, str] = {}
 
 
@@ -212,17 +211,14 @@ async def _get_manager():
 
 
 class Changes:
-    """A counter the media-session events bump, so a request can wait on it.
-
-    Polling is why the page lagged behind the Windows volume overlay: the
-    overlay is told the moment an app reports a change, while the page only
-    found out on its next poll. Subscribing to the same events and holding
-    /api/state open until one fires gets the page the news just as fast.
+    """A counter bumped whenever the playback state moves, so a request can
+    wait on it instead of the page polling on a timer.
     """
 
     def __init__(self) -> None:
         self.version = 0
-        self.live = False  # True once the events are subscribed
+        self.live = False  # True once the watcher is running
+        self.last_wanted = 0.0  # monotonic time a page last asked
         self._cond = threading.Condition()
 
     def bump(self, *_) -> None:
@@ -242,60 +238,66 @@ class Changes:
 
 
 changes = Changes()
-_watched: list = []  # (session, [(event name, registration token)])
-SESSION_EVENTS = ("playback_info_changed", "media_properties_changed", "timeline_properties_changed")
+WATCH_INTERVAL = 0.25  # seconds between looks while a page is open
+WATCH_IDLE_AFTER = 15  # stop looking this long after the last page request
 
 
-# Event handlers run on a WinRT thread-pool thread, not the worker, so they do
-# nothing but record the change and hand any WinRT work back to the worker.
-def _on_session_event(sender, args) -> None:
-    changes.bump()
+async def _fingerprint() -> tuple:
+    """The cheap, synchronous parts of the state that show a change.
+
+    Deliberately not WinRT event subscriptions. Their handlers arrive on
+    Windows' own threads and need the GIL, which the worker holds while it is
+    blocked inside a call to the same session - after a pause that stalled the
+    worker, and every command queued behind it, until something timed out.
+    Reading the state on the worker itself cannot collide that way.
+    """
+    parts = []
+    session = await _current_session()
+    if session is not None:
+        try:
+            info = session.get_playback_info()
+            c = info.controls
+            parts += [session.source_app_user_model_id, int(info.playback_status),
+                      c.is_play_enabled, c.is_pause_enabled, c.is_next_enabled,
+                      c.is_previous_enabled, c.is_playback_position_enabled]
+        except Exception:
+            parts.append("?")
+        try:
+            # A new track or a seek shows up as a new length or a fresh update.
+            timeline = session.get_timeline_properties()
+            parts += [timeline.end_time.total_seconds(), timeline.last_updated_time.timestamp()]
+        except Exception:
+            pass
+    volume = read_volume()
+    parts += [volume["level"], volume["muted"]]
+    return tuple(parts)
 
 
-def _on_media_properties(sender, args) -> None:
-    _track_art.clear()
-    changes.bump()
+async def watch_changes() -> None:
+    last, idle = None, True
+    while True:
+        if time.monotonic() - changes.last_wanted > WATCH_IDLE_AFTER:
+            idle = True
+            await asyncio.sleep(1)
+            continue
+        if idle:
+            # Nothing was watched meanwhile, so a returning page's version
+            # proves nothing: wake it and start comparing from here.
+            idle, last = False, None
+            changes.bump()
+        try:
+            now = await asyncio.wait_for(_fingerprint(), 2)
+        except Exception:
+            now = None
+        if last is not None and now != last:
+            changes.bump()
+        last = now
+        await asyncio.sleep(WATCH_INTERVAL)
 
 
-def _on_sessions_changed(sender, args) -> None:
-    changes.bump()
-    worker.loop.call_soon_threadsafe(_resubscribe)
-
-
-def _resubscribe() -> None:
-    """Listen to every registered session, dropping the ones we had before."""
-    for session, tokens in _watched:
-        for name, token in tokens:
-            try:
-                getattr(session, f"remove_{name}")(token)
-            except Exception:
-                pass  # the session has usually closed already
-    _watched.clear()
-
-    try:
-        sessions = list(_manager.get_sessions())
-    except Exception:
-        return
-    for session in sessions:
-        tokens = []
-        for name in SESSION_EVENTS:
-            handler = _on_media_properties if name == "media_properties_changed" else _on_session_event
-            try:
-                tokens.append((name, getattr(session, f"add_{name}")(handler)))
-            except Exception:
-                pass
-        _watched.append((session, tokens))
-
-
-async def watch_sessions() -> bool:
-    if not HAVE_WINRT:
-        return False
-    manager = await _get_manager()
-    manager.add_current_session_changed(_on_session_event)
-    manager.add_sessions_changed(_on_sessions_changed)
-    _resubscribe()
+def start_watching() -> None:
+    asyncio.run_coroutine_threadsafe(watch_changes(), worker.loop)
     changes.live = True
-    return True
 
 
 def _session_rank(session) -> int:
@@ -686,18 +688,18 @@ TIMEOUT_STATE = {
 }
 
 
-HOLD_SECONDS = 4  # also bounds how stale a volume change made on the PC can get
+HOLD_SECONDS = 10  # the watcher catches changes; this is only a heartbeat
 
 
 @app.get("/api/state")
 @protected
 def api_state():
-    # ?since=<version> holds the request until a media event fires, so the
-    # page hears about a change as soon as the app reports it.
+    # ?since=<version> holds the request until the watcher sees a change, so
+    # the page hears about it within a quarter second.
+    changes.last_wanted = time.monotonic()
     since = request.args.get("since", type=int)
     if since is not None and changes.live:
-        if changes.wait(since, HOLD_SECONDS) != since:
-            time.sleep(0.05)  # events arrive in bursts; let the rest land
+        changes.wait(since, HOLD_SECONDS)
     version = changes.version  # before reading, so a change mid-read is not lost
 
     # A wedged media session must not take the whole page down: the phone is
@@ -728,6 +730,7 @@ def api_command():
         via = worker.call(do_command, action)
         return jsonify({"ok": via is not None, "via": via})
     except FutureTimeout:
+        app.logger.warning("%s command timed out (worker busy or media session stuck)", action)
         return jsonify({"ok": False, "error": "timed out"})
 
 
@@ -855,11 +858,10 @@ def main() -> int:
                     print(f'          reading: {who} - "{what}" [{state["status"]}]')
                 else:
                     print("          no app is currently registered as playing media")
-                try:
-                    worker.call(watch_sessions, timeout=8)
-                    print("  events: live - changes show immediately")
-                except Exception as exc:
-                    print(f"  events: FAILED, page will poll: {type(exc).__name__}: {exc}")
+                started = time.monotonic()
+                worker.call(_fingerprint, timeout=10)
+                took = (time.monotonic() - started) * 1000
+                print(f"          change check: {took:.0f} ms (runs every {WATCH_INTERVAL * 1000:.0f} ms)")
             except Exception as exc:
                 media_ok = False
                 print(f"          FAILED: {type(exc).__name__}: {exc}")
@@ -888,15 +890,10 @@ def main() -> int:
     app.config["TOKEN"] = args.token
 
     suffix = f"?t={args.token}" if args.token else ""
-    try:
-        live = worker.call(watch_sessions, timeout=8)
-        events_note = "live - changes show immediately" if live else "unavailable, polling instead"
-    except Exception as exc:
-        events_note = f"unavailable, polling instead ({type(exc).__name__}: {exc})"
+    start_watching()
 
     print("webremote")
     print(f"  media : {media_note}")
-    print(f"  events: {events_note}")
     print(f"  volume: {volume_note}")
     print(f"  com   : {worker.apartment} apartment")
     print()
