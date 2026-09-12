@@ -186,7 +186,8 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action })
       });
-      setTimeout(poll, 180);
+      // players report their new state a beat after acting on the command
+      [120, 400, 900].forEach(d => setTimeout(poll, d));
     } catch (e) { setConnection(false, 'disconnected'); }
   }
 

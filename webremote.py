@@ -217,10 +217,10 @@ def _session_rank(session) -> int:
 async def _current_session():
     """The session worth showing.
 
-    Windows' "current" session is whichever app last took the media keys, which
-    is not always the one making noise - a paused Spotify keeps the title while
-    a browser plays a video. So fall back to scanning every registered session
-    for one that is actually playing.
+    Windows promotes whichever app last played to "current", which is almost
+    always the right answer and matches what the volume overlay shows. Only
+    when that session has closed or stopped do we scan the other registered
+    sessions for one that is playing.
     """
     if not HAVE_WINRT:
         return None
@@ -229,11 +229,20 @@ async def _current_session():
     except Exception:
         return None
 
-    best = manager.get_current_session()
-    best_rank = _session_rank(best)
-    if best_rank >= 3:
-        return best
+    current = manager.get_current_session()
+    # Preferring *any* playing session over the current one lets a stale
+    # session that still claims to be playing hijack the display, which showed
+    # up as the pause button never flipping back after pausing a browser tab.
+    try:
+        if current is not None and int(current.get_playback_info().playback_status) not in (
+            0,  # closed
+            3,  # stopped
+        ):
+            return current
+    except Exception:
+        pass
 
+    best, best_rank = current, _session_rank(current)
     try:
         for candidate in manager.get_sessions():
             rank = _session_rank(candidate)
@@ -335,10 +344,15 @@ async def read_state() -> dict:
         position = timeline.position.total_seconds()
         duration = timeline.end_time.total_seconds()
         if state["status"] == "playing":
-            # position only updates on events, so extrapolate to "now"
+            # Position only changes on events, so extrapolate to "now". Some
+            # players (browsers especially) go a long time between updates; if
+            # the last one predates the whole track the reading is stale rather
+            # than merely old, so leave it alone instead of running off the end.
             updated = timeline.last_updated_time
             if updated and updated.timestamp() > 0:
-                position += max(0.0, time.time() - updated.timestamp())
+                elapsed = max(0.0, time.time() - updated.timestamp())
+                if elapsed <= duration:
+                    position += elapsed
         if duration > 0:
             state["position"] = round(min(position, duration), 1)
             state["duration"] = round(duration, 1)
@@ -388,9 +402,21 @@ _endpoint = None
 
 
 def _volume_endpoint():
+    """The master volume of the default output device - the Windows volume.
+
+    This is the endpoint volume, the same one the tray slider and the volume
+    keys move. It is deliberately not a per-application session volume.
+    """
     global _endpoint
-    if _endpoint is None:
-        speakers = AudioUtilities.GetSpeakers()
+    if _endpoint is not None:
+        return _endpoint
+
+    speakers = AudioUtilities.GetSpeakers()
+    if hasattr(speakers, "EndpointVolume"):
+        # pycaw >= 2023 returns an AudioDevice wrapper that activates for us
+        _endpoint = speakers.EndpointVolume
+    else:
+        # older pycaw handed back the raw IMMDevice pointer
         interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
         _endpoint = ctypes_cast(interface, POINTER(IAudioEndpointVolume))
     return _endpoint
