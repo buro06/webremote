@@ -79,6 +79,22 @@ WinRT posts async completions to an STA thread's Windows message queue, and
 that thread runs an asyncio loop rather than a message pump, so every await
 hangs until it times out. Report it - there is no user-side workaround.
 
+### "winrt-windows-... does not provide the extra 'all'" during install
+
+Harmless. Those warnings come from transitive `winrt-*` packages that have no
+`all` extra of their own; the packages still install correctly.
+
+### Track info appears for one app but not another
+
+An app only appears if it registers with the Windows media session. Spotify,
+Chrome and Edge do this reliably; Firefox needs `media.hardwaremediakeys.enabled`
+set to true in `about:config`; some players never register at all and can only
+be driven by media keys.
+
+The remote prefers whichever session is actually playing over the one Windows
+calls "current", so a paused Spotify no longer masks a playing browser tab.
+`--check` reports how many sessions are registered and which one it is reading.
+
 ### Buttons work, but there is no track info and no volume slider
 
 The optional extras are not installed, so the remote is in media-key mode.

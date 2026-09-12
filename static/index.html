@@ -259,8 +259,9 @@
 
     let note = '';
     if (s.error) note = s.error;
-    else if (!s.available) note = 'No media session detected on the PC.';
+    else if (!s.available) note = 'No app on the PC is registered as playing media.';
     else if (s.backend === 'mediakeys') note = 'Media-key mode - no track info from this PC.';
+    if (!note && s.volume && s.volume.error) note = 'Volume unavailable: ' + s.volume.error;
     el.note.textContent = note;
   }
 

@@ -204,14 +204,52 @@ async def _get_manager():
     return _manager
 
 
+def _session_rank(session) -> int:
+    """Playing beats paused beats everything else."""
+    if session is None:
+        return -1
+    try:
+        return {4: 3, 5: 2}.get(int(session.get_playback_info().playback_status), 1)
+    except Exception:
+        return 0
+
+
 async def _current_session():
+    """The session worth showing.
+
+    Windows' "current" session is whichever app last took the media keys, which
+    is not always the one making noise - a paused Spotify keeps the title while
+    a browser plays a video. So fall back to scanning every registered session
+    for one that is actually playing.
+    """
     if not HAVE_WINRT:
         return None
     try:
         manager = await _get_manager()
-        return manager.get_current_session()
     except Exception:
         return None
+
+    best = manager.get_current_session()
+    best_rank = _session_rank(best)
+    if best_rank >= 3:
+        return best
+
+    try:
+        for candidate in manager.get_sessions():
+            rank = _session_rank(candidate)
+            if rank > best_rank:
+                best, best_rank = candidate, rank
+    except Exception:
+        pass
+    return best
+
+
+async def _session_count() -> int:
+    try:
+        manager = await _get_manager()
+        return len(list(manager.get_sessions()))
+    except Exception:
+        return 0
 
 
 async def _thumbnail_bytes(props) -> bytes | None:
@@ -360,7 +398,8 @@ def _volume_endpoint():
 
 def read_volume() -> dict:
     if not HAVE_PYCAW:
-        return {"available": False, "level": None, "muted": None}
+        return {"available": False, "level": None, "muted": None,
+                "error": PYCAW_ERROR or "pycaw not installed"}
     try:
         endpoint = _volume_endpoint()
         return {
@@ -368,8 +407,10 @@ def read_volume() -> dict:
             "level": round(endpoint.GetMasterVolumeLevelScalar() * 100),
             "muted": bool(endpoint.GetMute()),
         }
-    except Exception:
-        return {"available": False, "level": None, "muted": None}
+    except Exception as exc:
+        # Installed but not usable - say why instead of just greying the slider.
+        return {"available": False, "level": None, "muted": None,
+                "error": f"{type(exc).__name__}: {exc}"}
 
 
 def set_volume(level: float) -> bool:
@@ -469,6 +510,7 @@ def api_state():
         state = dict(TIMEOUT_STATE)
     try:
         state["volume"] = worker.call(read_volume, timeout=4)
+        state["sessions"] = worker.call(_session_count, timeout=4)
     except FutureTimeout:
         state["volume"] = {"available": False, "level": None, "muted": None}
     state["time"] = time.time()
@@ -556,19 +598,51 @@ def main() -> int:
     volume_note = "system master volume" if HAVE_PYCAW else "media keys only (pycaw not installed)"
 
     if args.check:
+        # Actually call both backends. Importing a package proves nothing about
+        # whether it works, which is how the last two faults stayed invisible.
         print(f"  python: {sys.version.split()[0]} on {sys.platform}")
         print(f"  com   : {worker.apartment} apartment")
+
         print(f"  media : {media_note}")
         for line in BINDING_ERRORS:
             print(f"          tried {line}")
         if not HAVE_WINRT and IS_WINDOWS:
             print(f"          fix:   {MEDIA_FIX}")
+
+        media_ok = HAVE_WINRT
+        if HAVE_WINRT:
+            try:
+                state = worker.call(read_state, timeout=10)
+                count = worker.call(_session_count, timeout=10)
+                print(f"          {count} media session(s) registered")
+                if state["available"]:
+                    who = state["app"] or "unknown app"
+                    what = state["title"] or "no title reported"
+                    print(f'          reading: {who} - "{what}" [{state["status"]}]')
+                else:
+                    print("          no app is currently registered as playing media")
+            except Exception as exc:
+                media_ok = False
+                print(f"          FAILED: {type(exc).__name__}: {exc}")
+
         print(f"  volume: {volume_note}")
         if PYCAW_ERROR:
             print(f"          tried pycaw: {PYCAW_ERROR}")
             if IS_WINDOWS:
                 print(f"          fix:   {VOLUME_FIX}")
-        return 0 if (HAVE_WINRT and HAVE_PYCAW) else 1
+
+        volume_ok = False
+        try:
+            vol = worker.call(read_volume, timeout=10)
+            volume_ok = vol["available"]
+            if volume_ok:
+                print(f"          reading: {vol['level']}%, muted={vol['muted']}")
+            elif vol.get("error"):
+                print(f"          FAILED: {vol['error']}")
+        except Exception as exc:
+            print(f"          FAILED: {type(exc).__name__}: {exc}")
+
+        return 0 if (media_ok and volume_ok) else 1
 
     if args.token == "generate":
         args.token = secrets.token_urlsafe(8)

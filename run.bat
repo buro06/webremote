@@ -216,7 +216,10 @@ REM which the control module cannot be imported at all.
 if errorlevel 1 echo         ...unavailable here - the remote will run without track info.
 
 echo   [3/3] system volume...
-"%VENVPY%" -m pip install --only-binary=:all: --quiet pycaw comtypes
+REM pycaw and comtypes are pure Python; only psutil underneath them is
+REM compiled, so restrict the no-compile rule to that one package rather
+REM than refusing source distributions across the board.
+"%VENVPY%" -m pip install --only-binary=psutil --quiet pycaw comtypes
 if errorlevel 1 echo         ...unavailable here - the volume slider will be disabled.
 
 echo.
