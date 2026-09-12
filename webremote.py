@@ -35,19 +35,27 @@ IS_WINDOWS = sys.platform == "win32"
 # --------------------------------------------------------------------------
 # optional dependencies
 # --------------------------------------------------------------------------
-try:
-    from winsdk.windows.media.control import (
-        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
-    )
-    from winsdk.windows.storage.streams import (
-        Buffer,
-        DataReader,
-        InputStreamOptions,
-    )
+# The Windows media-session bindings ship under two different distributions:
+#   winsdk                        - wheels for Python <= 3.12
+#   winrt-Windows.Media.Control   - the maintained successor, wheels for 3.13
+# The APIs we use are identical, so accept whichever one is installed.
+MediaManager = Buffer = DataReader = InputStreamOptions = None
+BINDING = None
 
-    HAVE_WINRT = True
-except Exception:  # pragma: no cover - not on Windows / winsdk missing
-    HAVE_WINRT = False
+for _package in ("winsdk", "winrt"):
+    try:
+        _control = __import__(f"{_package}.windows.media.control", fromlist=["x"])
+        _streams = __import__(f"{_package}.windows.storage.streams", fromlist=["x"])
+        MediaManager = _control.GlobalSystemMediaTransportControlsSessionManager
+        Buffer = _streams.Buffer
+        DataReader = _streams.DataReader
+        InputStreamOptions = _streams.InputStreamOptions
+        BINDING = _package
+        break
+    except Exception:  # not installed, or not on Windows
+        continue
+
+HAVE_WINRT = BINDING is not None
 
 try:
     from ctypes import POINTER, cast as ctypes_cast
@@ -195,7 +203,7 @@ def _cache_art(data: bytes | None) -> str | None:
 async def read_state() -> dict:
     state = {
         "available": False,
-        "backend": "winrt" if HAVE_WINRT else ("mediakeys" if IS_WINDOWS else "none"),
+        "backend": "session" if HAVE_WINRT else ("mediakeys" if IS_WINDOWS else "none"),
         "status": "closed",
         "title": None,
         "artist": None,
@@ -468,7 +476,9 @@ def main() -> None:
 
     suffix = f"?t={args.token}" if args.token else ""
     print("webremote")
-    print(f"  media : {'Windows media session' if HAVE_WINRT else 'media keys only (winsdk not installed)'}")
+    media_note = f"Windows media session (via {BINDING})" if HAVE_WINRT else \
+        "media keys only - no track info (see README: 'No wheel for your Python')"
+    print(f"  media : {media_note}")
     print(f"  volume: {'system master volume' if HAVE_PYCAW else 'media keys only (pycaw not installed)'}")
     print()
     print(f"  local : http://127.0.0.1:{args.port}/{suffix}")

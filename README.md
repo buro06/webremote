@@ -54,13 +54,45 @@ python webremote.py --token mysecret
   Allow it, or the phone can't reach the server.
 - Add the page to your phone's home screen for a full-screen app-like remote.
 
+## Troubleshooting
+
+### "Microsoft Visual C++ 14.0 or greater is required" / "building wheel failed"
+
+**You do not need Visual Studio.** That error means pip found no prebuilt wheel
+for your Python version and fell back to compiling from source. The media
+bindings are compiled C++ extensions with a limited range of wheels:
+
+| Package | Wheels for |
+| --- | --- |
+| `winsdk` | Python 3.8 - 3.12 |
+| `winrt-Windows.Media.Control` (successor) | Python 3.9 - 3.13 |
+
+So on Python 3.14 neither one installs without a compiler. Pick one:
+
+1. **Install Python 3.13** (or 3.12) alongside your current one and build the
+   venv with it - this gets you full track info:
+   ```
+   py -3.13 -m venv .venv
+   .venv\Scripts\python.exe -m pip install --only-binary=:all: -r requirements.txt
+   ```
+2. **Skip the extras.** The remote works without them, just in media-key mode:
+   buttons control whatever is playing, but no title/artist/art/seek.
+   ```
+   pip install flask
+   python webremote.py
+   ```
+
+Always add `--only-binary=:all:` to pip installs here. It makes pip fail fast
+with "no matching distribution" instead of trying to invoke a compiler.
+`run.bat` does this for you and falls back to a core-only install.
+
 ## Degraded modes
 
 Everything is optional except Flask:
 
 | Missing | Effect |
 | --- | --- |
-| `winsdk` | No track info; buttons fall back to virtual media keys |
+| `winsdk` / `winrt-*` | No track info; buttons fall back to virtual media keys |
 | `pycaw` | Volume slider disabled; mute/up/down fall back to media keys |
 | Not on Windows | Server runs and serves the page, but controls do nothing |
 

@@ -259,7 +259,7 @@
 
     let note = '';
     if (!s.available) note = 'No media session detected on the PC.';
-    else if (s.backend === 'mediakeys') note = 'Media-key mode (install winsdk for track info).';
+    else if (s.backend === 'mediakeys') note = 'Media-key mode - no track info from this PC.';
     el.note.textContent = note;
   }
 

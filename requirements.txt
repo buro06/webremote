@@ -1,4 +1,15 @@
 flask>=3.0
-winsdk>=1.0.0b10 ; sys_platform == "win32"
+
+# --- Windows extras (all optional; the remote falls back to media keys) ------
+# Media session bindings. These are compiled C++ extensions, so they only
+# install cleanly when a prebuilt wheel exists for your Python version:
+#   winsdk                       -> wheels for Python 3.8 - 3.12
+#   winrt-Windows.Media.Control  -> wheels for Python 3.9 - 3.13
+# No wheels exist for Python 3.14 yet; see README, "No wheel for your Python".
+winsdk>=1.0.0b10 ; sys_platform == "win32" and python_version < "3.13"
+winrt-Windows.Media.Control>=3.2 ; sys_platform == "win32" and python_version == "3.13"
+winrt-Windows.Storage.Streams>=3.2 ; sys_platform == "win32" and python_version == "3.13"
+
+# System volume. Pure Python, but pulls in psutil, which is also compiled.
 pycaw>=20240210 ; sys_platform == "win32"
 comtypes>=1.2 ; sys_platform == "win32"
