@@ -201,26 +201,29 @@ internet.
 
 ## Updates
 
-The server subscribes to the same media-session events that drive the Windows
-volume overlay, and the page asks `/api/state?since=<version>`, which the
-server holds open until one of those events fires (or four seconds pass, which
-is also how quickly a volume change made on the PC shows up). Play/pause,
-track and seek changes therefore appear as soon as the app reports them. The
-play/pause icon also flips the moment you tap it.
+While a page is open, the server checks the playback status, controls,
+timeline and volume every quarter second. The page asks
+`/api/state?since=<version>`, which the server holds open until that check
+sees a change (or ten seconds pass), so play/pause, track, seek and volume
+changes show up within about a quarter second. The play/pause icon also flips
+the moment you tap it. `--check` prints how long one check takes.
 
-The startup banner and `--check` say `events: live` when this is working. If
-the subscription fails the page falls back to polling: once a second while
-something is playing, every four seconds when paused. Either way it stops
-while the tab is hidden or the phone is asleep and refreshes immediately on
-becoming visible again. Successful state requests are filtered out of the
-server's console so they cannot bury real errors; every other request still
-logs.
+This deliberately does not subscribe to WinRT media-session events. Their
+handlers run on Windows' own threads and need Python's GIL, which the worker
+holds while it is blocked in a call to the same session; that stalled every
+command after a pause.
+
+The checking stops 15 seconds after the last page request, and the page makes
+no requests while the tab is hidden or the phone is asleep. It refreshes
+immediately on becoming visible again. Successful state requests are filtered
+out of the server's console so they cannot bury real errors; every other
+request still logs, and a command that times out logs a warning.
 
 ## API
 
 | Method | Path | Body |
 | --- | --- | --- |
-| GET | `/api/state` | — ; `?since=<version>` waits up to 4 s for a change |
+| GET | `/api/state` | — ; `?since=<version>` waits up to 10 s for a change |
 | POST | `/api/command` | `{"action": "playpause\|play\|pause\|next\|prev\|stop"}`, replies with `via` = which route worked |
 | POST | `/api/seek` | `{"position": 42.0}` (seconds) |
 | POST | `/api/volume` | `{"level": 40}` or `{"delta": -5}` or `{"mute": null}` (null toggles) |

@@ -324,7 +324,7 @@
     // With live updates the server holds this request until something
     // changes. The abort covers a request frozen while the phone slept.
     const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), 12000);
+    const timer = setTimeout(() => abort.abort(), 20000);
     const params = state && state.live && state.version != null ? { since: state.version } : null;
     try {
       const s = await api('/api/state', { signal: abort.signal }, params);
