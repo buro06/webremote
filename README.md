@@ -65,6 +65,20 @@ First, ask the environment what it supports:
 It prints the media and volume backends, the import error behind anything
 missing, and the pip command that fixes it. Exit code 0 means full features.
 
+### TimeoutError on /api/state, or the page shows "not responding"
+
+The COM apartment is wrong. `webremote.py --check` prints it:
+
+```
+  com   : MTA apartment
+```
+
+`MTA` is correct. If it says `STA - async calls will hang`, something in the
+process put the worker thread in a single-threaded apartment before we did.
+WinRT posts async completions to an STA thread's Windows message queue, and
+that thread runs an asyncio loop rather than a message pump, so every await
+hangs until it times out. Report it - there is no user-side workaround.
+
 ### Buttons work, but there is no track info and no volume slider
 
 The optional extras are not installed, so the remote is in media-key mode.

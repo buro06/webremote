@@ -258,7 +258,8 @@
     }
 
     let note = '';
-    if (!s.available) note = 'No media session detected on the PC.';
+    if (s.error) note = s.error;
+    else if (!s.available) note = 'No media session detected on the PC.';
     else if (s.backend === 'mediakeys') note = 'Media-key mode - no track info from this PC.';
     el.note.textContent = note;
   }

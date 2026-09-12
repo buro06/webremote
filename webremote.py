@@ -26,6 +26,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import TimeoutError as FutureTimeout
 from functools import wraps
 
 from flask import Flask, jsonify, request, send_from_directory, abort
@@ -112,21 +113,50 @@ def tap_key(name: str) -> bool:
 # a pool of threads. Funnelling all of it through one thread with one event
 # loop keeps things predictable.
 # --------------------------------------------------------------------------
+def init_apartment() -> str:
+    """Put the calling thread in the COM multi-threaded apartment.
+
+    This matters more than it looks. WinRT hands an async completion straight
+    to a thread in the MTA, but for a single-threaded apartment it posts the
+    completion to that thread's Windows message queue instead. This thread
+    runs an asyncio event loop, not a window message pump, so in an STA
+    nothing ever dispatches the completion and every await hangs forever.
+    comtypes.CoInitialize(), which this used to call, creates exactly that STA.
+    """
+    if not IS_WINDOWS:
+        return "n/a (not Windows)"
+
+    for module in ("winrt.runtime", "winsdk._winrt", "winsdk.system"):
+        try:
+            __import__(module, fromlist=["x"]).init_apartment()
+            break
+        except Exception:
+            continue
+
+    # Also the verification: CoInitializeEx reports RPC_E_CHANGED_MODE if the
+    # thread is already an STA, and otherwise joins/creates the MTA itself.
+    try:
+        import ctypes
+
+        COINIT_MULTITHREADED = 0x0
+        RPC_E_CHANGED_MODE = 0x80010106
+        hr = ctypes.windll.ole32.CoInitializeEx(None, COINIT_MULTITHREADED) & 0xFFFFFFFF
+        return "STA - async calls will hang" if hr == RPC_E_CHANGED_MODE else "MTA"
+    except Exception as exc:
+        return f"unknown ({type(exc).__name__}: {exc})"
+
+
 class Worker:
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
+        self.apartment = "?"
         self._ready = threading.Event()
         threading.Thread(target=self._run, name="winrt-worker", daemon=True).start()
         self._ready.wait(5)
 
     def _run(self) -> None:
         asyncio.set_event_loop(self.loop)
-        try:
-            import comtypes
-
-            comtypes.CoInitialize()
-        except Exception:
-            pass
+        self.apartment = init_apartment()
         self.loop.call_soon(self._ready.set)
         self.loop.run_forever()
 
@@ -140,7 +170,11 @@ class Worker:
             return result
 
         future = asyncio.run_coroutine_threadsafe(runner(), self.loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeout:
+            future.cancel()
+            raise
 
 
 worker = Worker()
@@ -166,7 +200,7 @@ _art_lock = threading.Lock()
 async def _get_manager():
     global _manager
     if _manager is None:
-        _manager = await MediaManager.request_async()
+        _manager = await asyncio.wait_for(MediaManager.request_async(), 5)
     return _manager
 
 
@@ -250,7 +284,7 @@ async def read_state() -> dict:
         pass
 
     try:
-        props = await session.try_get_media_properties_async()
+        props = await asyncio.wait_for(session.try_get_media_properties_async(), 5)
         state["title"] = props.title or None
         state["artist"] = props.artist or None
         state["album"] = props.album_title or None
@@ -407,11 +441,36 @@ def index():
     return send_from_directory(os.path.join(HERE, "static"), "index.html")
 
 
+TIMEOUT_STATE = {
+    "available": False,
+    "backend": "timeout",
+    "status": "closed",
+    "title": None,
+    "artist": None,
+    "album": None,
+    "app": None,
+    "position": None,
+    "duration": None,
+    "art": None,
+    "controls": {},
+    "error": "The Windows media session is not responding.",
+}
+
+
 @app.get("/api/state")
 @protected
 def api_state():
-    state = worker.call(read_state)
-    state["volume"] = worker.call(read_volume)
+    # A wedged media session must not take the whole page down: the phone is
+    # still talking to the PC, so answer 200 and say what is wrong.
+    try:
+        state = worker.call(read_state, timeout=4)
+    except FutureTimeout:
+        app.logger.warning("media session read timed out (apartment: %s)", worker.apartment)
+        state = dict(TIMEOUT_STATE)
+    try:
+        state["volume"] = worker.call(read_volume, timeout=4)
+    except FutureTimeout:
+        state["volume"] = {"available": False, "level": None, "muted": None}
     state["time"] = time.time()
     return jsonify(state)
 
@@ -422,7 +481,10 @@ def api_command():
     action = (request.get_json(silent=True) or {}).get("action", "")
     if action not in {"playpause", "play", "pause", "next", "prev", "stop"}:
         return jsonify({"ok": False, "error": "unknown action"}), 400
-    return jsonify({"ok": bool(worker.call(do_command, action))})
+    try:
+        return jsonify({"ok": bool(worker.call(do_command, action))})
+    except FutureTimeout:
+        return jsonify({"ok": False, "error": "timed out"})
 
 
 @app.post("/api/seek")
@@ -433,22 +495,28 @@ def api_seek():
         position = float(body.get("position"))
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "bad position"}), 400
-    return jsonify({"ok": bool(worker.call(do_seek, position))})
+    try:
+        return jsonify({"ok": bool(worker.call(do_seek, position))})
+    except FutureTimeout:
+        return jsonify({"ok": False, "error": "timed out"})
 
 
 @app.post("/api/volume")
 @protected
 def api_volume():
     body = request.get_json(silent=True) or {}
-    if "mute" in body:
-        ok = worker.call(set_mute, body["mute"])
-    elif "delta" in body:
-        ok = worker.call(nudge_volume, float(body["delta"]))
-    elif "level" in body:
-        ok = worker.call(set_volume, float(body["level"]))
-    else:
-        return jsonify({"ok": False, "error": "nothing to do"}), 400
-    return jsonify({"ok": bool(ok), "volume": worker.call(read_volume)})
+    try:
+        if "mute" in body:
+            ok = worker.call(set_mute, body["mute"])
+        elif "delta" in body:
+            ok = worker.call(nudge_volume, float(body["delta"]))
+        elif "level" in body:
+            ok = worker.call(set_volume, float(body["level"]))
+        else:
+            return jsonify({"ok": False, "error": "nothing to do"}), 400
+        return jsonify({"ok": bool(ok), "volume": worker.call(read_volume, timeout=4)})
+    except FutureTimeout:
+        return jsonify({"ok": False, "error": "timed out"})
 
 
 @app.get("/api/art/<key>")
@@ -489,6 +557,7 @@ def main() -> int:
 
     if args.check:
         print(f"  python: {sys.version.split()[0]} on {sys.platform}")
+        print(f"  com   : {worker.apartment} apartment")
         print(f"  media : {media_note}")
         for line in BINDING_ERRORS:
             print(f"          tried {line}")
@@ -509,6 +578,7 @@ def main() -> int:
     print("webremote")
     print(f"  media : {media_note}")
     print(f"  volume: {volume_note}")
+    print(f"  com   : {worker.apartment} apartment")
     print()
     print(f"  local : http://127.0.0.1:{args.port}/{suffix}")
     print(f"  phone : http://{local_ip()}:{args.port}/{suffix}")
