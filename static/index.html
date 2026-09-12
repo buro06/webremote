@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101014">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>PC Remote</title>
+<style>
+  :root {
+    --bg: #101014;
+    --panel: #1b1b21;
+    --panel-hi: #26262e;
+    --text: #f2f2f5;
+    --muted: #8d8d99;
+    --accent: #4c8dff;
+    --ok: #35c46b;
+    --bad: #e5484d;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom));
+    overscroll-behavior: none;
+  }
+  .app { width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 14px; }
+
+  header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .02em; color: var(--muted); }
+  .status { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); transition: background .2s; }
+  .status.online .dot { background: var(--ok); box-shadow: 0 0 0 0 rgba(53,196,107,.6); animation: pulse 2.4s infinite; }
+  .status.offline .dot { background: var(--bad); }
+  @keyframes pulse { 70% { box-shadow: 0 0 0 7px rgba(53,196,107,0); } 100% { box-shadow: 0 0 0 0 rgba(53,196,107,0); } }
+
+  .card { background: var(--panel); border-radius: 18px; padding: 16px; }
+
+  .art {
+    aspect-ratio: 1 / 1; width: 100%; border-radius: 14px; overflow: hidden;
+    background: var(--panel-hi) center/cover no-repeat;
+    display: flex; align-items: center; justify-content: center; margin-bottom: 16px;
+  }
+  .art svg { width: 33%; height: 33%; opacity: .18; }
+  .art.has-art svg { display: none; }
+
+  .title { font-size: 19px; font-weight: 650; margin: 0 0 3px; }
+  .artist { color: var(--muted); font-size: 14px; margin: 0; }
+  .source { color: var(--muted); font-size: 11px; margin: 8px 0 0; text-transform: uppercase; letter-spacing: .06em; opacity: .7; }
+  .title, .artist, .source { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .times { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
+
+  input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 100%; background: transparent; margin: 14px 0 0; height: 22px;
+  }
+  input[type=range]::-webkit-slider-runnable-track { height: 6px; border-radius: 3px; background: var(--panel-hi); }
+  input[type=range]::-moz-range-track { height: 6px; border-radius: 3px; background: var(--panel-hi); }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--text);
+    margin-top: -6px; border: none;
+  }
+  input[type=range]::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: var(--text); border: none; }
+  input[type=range]:disabled { opacity: .4; }
+
+  .transport { display: flex; align-items: center; justify-content: center; gap: 18px; margin-top: 14px; }
+  button {
+    border: none; background: var(--panel-hi); color: var(--text); border-radius: 50%;
+    width: 62px; height: 62px; display: grid; place-items: center; cursor: pointer;
+    transition: transform .08s ease, background .15s ease, opacity .15s;
+  }
+  button:active { transform: scale(.92); background: #33333d; }
+  button:disabled { opacity: .35; cursor: default; }
+  button.primary { width: 78px; height: 78px; background: var(--accent); }
+  button.primary:active { background: #3f79dd; }
+  button svg { width: 26px; height: 26px; fill: currentColor; }
+  /* the `hidden` attribute has no effect on SVG elements, so hide by class */
+  .hide { display: none !important; }
+  button.primary svg { width: 32px; height: 32px; }
+  button.small { width: 46px; height: 46px; }
+  button.small svg { width: 20px; height: 20px; }
+
+  .volume { display: flex; align-items: center; gap: 12px; }
+  .volume input[type=range] { margin: 0; }
+  .vol-value { font-size: 12px; color: var(--muted); min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
+  .muted-on { color: var(--bad); }
+
+  .note { text-align: center; font-size: 12px; color: var(--muted); min-height: 16px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>PC Remote</h1>
+    <div class="status" id="status"><span class="dot"></span><span id="status-text">connecting…</span></div>
+  </header>
+
+  <section class="card">
+    <div class="art" id="art">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>
+    </div>
+    <p class="title" id="title">Nothing playing</p>
+    <p class="artist" id="artist">—</p>
+    <p class="source" id="source"></p>
+
+    <input type="range" id="seek" min="0" max="100" value="0" step="0.1" disabled aria-label="Seek">
+    <div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div>
+
+    <div class="transport">
+      <button id="prev" aria-label="Previous track">
+        <svg viewBox="0 0 24 24"><path d="M6 6h2.5v12H6zM20 6v12L9.5 12z"/></svg>
+      </button>
+      <button id="playpause" class="primary" aria-label="Play or pause">
+        <svg id="icon-play" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>
+        <svg id="icon-pause" class="hide" viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>
+      </button>
+      <button id="next" aria-label="Next track">
+        <svg viewBox="0 0 24 24"><path d="M15.5 6H18v12h-2.5zM4 6v12l10.5-6z"/></svg>
+      </button>
+    </div>
+  </section>
+
+  <section class="card volume">
+    <button id="mute" class="small" aria-label="Mute">
+      <svg id="icon-vol" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
+      <svg id="icon-muted" class="hide" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4zm15.7 0.3l-1.4-1.4L16 10.2l-2.3-2.3-1.4 1.4 2.3 2.3-2.3 2.3 1.4 1.4 2.3-2.3 2.3 2.3 1.4-1.4-2.3-2.3z"/></svg>
+    </button>
+    <input type="range" id="vol" min="0" max="100" value="0" aria-label="Volume">
+    <span class="vol-value" id="vol-value">—</span>
+  </section>
+
+  <p class="note" id="note"></p>
+</div>
+
+<script>
+(() => {
+  const token = new URLSearchParams(location.search).get('t');
+  const qs = token ? '?t=' + encodeURIComponent(token) : '';
+  const $ = id => document.getElementById(id);
+
+  const el = {
+    status: $('status'), statusText: $('status-text'), note: $('note'),
+    art: $('art'), title: $('title'), artist: $('artist'), source: $('source'),
+    seek: $('seek'), pos: $('pos'), dur: $('dur'),
+    prev: $('prev'), next: $('next'), playpause: $('playpause'),
+    iconPlay: $('icon-play'), iconPause: $('icon-pause'),
+    vol: $('vol'), volValue: $('vol-value'), mute: $('mute'),
+    iconVol: $('icon-vol'), iconMuted: $('icon-muted')
+  };
+
+  let state = null;
+  let failures = 0;
+  let holdSeek = 0;     // ignore server position right after a user seek
+  let holdVolume = 0;
+  let dragging = false;
+  let localPos = 0, localPosAt = 0;
+
+  const fmt = s => {
+    if (s == null || !isFinite(s)) return '0:00';
+    s = Math.max(0, Math.round(s));
+    const m = Math.floor(s / 60), sec = String(s % 60).padStart(2, '0');
+    return m >= 60 ? `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+  };
+
+  function setConnection(online, text) {
+    el.status.className = 'status ' + (online ? 'online' : 'offline');
+    el.statusText.textContent = text;
+  }
+
+  async function api(path, options) {
+    const res = await fetch(path + qs, Object.assign({ cache: 'no-store' }, options));
+    if (!res.ok) throw new Error(res.status === 401 ? 'unauthorized' : 'http ' + res.status);
+    return res.json();
+  }
+
+  async function send(action) {
+    try {
+      await api('/api/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action })
+      });
+      setTimeout(poll, 180);
+    } catch (e) { setConnection(false, 'disconnected'); }
+  }
+
+  async function volume(payload) {
+    holdVolume = Date.now() + 800;
+    try {
+      const data = await api('/api/volume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (data.volume) renderVolume(data.volume, true);
+    } catch (e) { setConnection(false, 'disconnected'); }
+  }
+
+  function renderVolume(v, force) {
+    if (!force && Date.now() < holdVolume) return;
+    const on = v && v.available;
+    el.vol.disabled = !on;
+    if (on) {
+      if (!dragging) el.vol.value = v.level;
+      el.volValue.textContent = v.muted ? 'muted' : v.level + '%';
+      el.volValue.classList.toggle('muted-on', !!v.muted);
+      el.iconVol.classList.toggle('hide', !!v.muted);
+      el.iconMuted.classList.toggle('hide', !v.muted);
+    } else {
+      el.volValue.textContent = '—';
+    }
+  }
+
+  function render(s) {
+    state = s;
+    const playing = s.status === 'playing';
+    el.iconPlay.classList.toggle('hide', playing);
+    el.iconPause.classList.toggle('hide', !playing);
+
+    el.title.textContent = s.title || (s.available ? 'Unknown track' : 'Nothing playing');
+    el.artist.textContent = s.artist || s.album || '—';
+    el.source.textContent = (s.app || '').replace(/\.exe$/i, '').replace(/!.*/, '');
+
+    const artUrl = s.art ? `/api/art/${s.art}${qs}` : null;
+    if (artUrl !== el.art.dataset.url) {
+      el.art.dataset.url = artUrl || '';
+      el.art.style.backgroundImage = artUrl ? `url("${artUrl}")` : 'none';
+      el.art.classList.toggle('has-art', !!artUrl);
+    }
+
+    // when there's no session at all, leave buttons live: media keys may still work
+    const c = s.controls || {};
+    el.prev.disabled = s.available && !c.prev;
+    el.next.disabled = s.available && !c.next;
+    el.playpause.disabled = s.available && !c.play && !c.pause;
+
+    const seekable = s.duration != null && c.seek;
+    el.seek.disabled = !seekable;
+    el.dur.textContent = fmt(s.duration);
+    if (s.duration != null) el.seek.max = s.duration;
+
+    if (Date.now() > holdSeek && s.position != null) {
+      localPos = s.position;
+      localPosAt = Date.now();
+      if (!dragging) {
+        el.seek.value = s.position;
+        el.pos.textContent = fmt(s.position);
+      }
+    } else if (s.position == null) {
+      el.pos.textContent = '0:00';
+      el.seek.value = 0;
+    }
+
+    let note = '';
+    if (!s.available) note = 'No media session detected on the PC.';
+    else if (s.backend === 'mediakeys') note = 'Media-key mode (install winsdk for track info).';
+    el.note.textContent = note;
+  }
+
+  // smooth the progress bar between polls
+  setInterval(() => {
+    if (!state || state.status !== 'playing' || dragging || state.duration == null) return;
+    const p = Math.min(state.duration, localPos + (Date.now() - localPosAt) / 1000);
+    el.seek.value = p;
+    el.pos.textContent = fmt(p);
+  }, 500);
+
+  async function poll() {
+    try {
+      const s = await api('/api/state');
+      failures = 0;
+      setConnection(true, 'connected');
+      render(s);
+      renderVolume(s.volume);
+    } catch (e) {
+      if (++failures >= 2) {
+        setConnection(false, e.message === 'unauthorized' ? 'unauthorized' : 'disconnected');
+      }
+    }
+  }
+
+  el.prev.addEventListener('click', () => send('prev'));
+  el.next.addEventListener('click', () => send('next'));
+  el.playpause.addEventListener('click', () => send('playpause'));
+  el.mute.addEventListener('click', () => volume({ mute: null }));
+
+  ['pointerdown', 'touchstart'].forEach(ev => {
+    el.seek.addEventListener(ev, () => { dragging = true; }, { passive: true });
+    el.vol.addEventListener(ev, () => { dragging = true; }, { passive: true });
+  });
+  el.seek.addEventListener('input', () => { el.pos.textContent = fmt(+el.seek.value); });
+  el.seek.addEventListener('change', async () => {
+    dragging = false;
+    holdSeek = Date.now() + 1200;
+    localPos = +el.seek.value; localPosAt = Date.now();
+    try {
+      await api('/api/seek', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ position: +el.seek.value })
+      });
+    } catch (e) { setConnection(false, 'disconnected'); }
+  });
+  el.vol.addEventListener('input', () => { el.volValue.textContent = el.vol.value + '%'; });
+  el.vol.addEventListener('change', () => { dragging = false; volume({ level: +el.vol.value }); });
+
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+
+  poll();
+  setInterval(poll, 1000);
+})();
+</script>
+</body>
+</html>
