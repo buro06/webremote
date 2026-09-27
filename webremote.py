@@ -39,6 +39,7 @@ HERE = Path(__file__).resolve().parent
 
 TICK = 0.25  # seconds between change checks while a page is open
 FULL_REFRESH = 3.0  # re-read everything at least this often, changed or not
+HEARTBEAT = 5.0  # longest silence on an open page's stream; its online light relies on it
 
 
 # --------------------------------------------------------------------------
@@ -866,9 +867,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             while True:
                 try:
-                    self.wfile.write(f"data: {q.get(timeout=15)}\n\n".encode())
+                    self.wfile.write(f"data: {q.get(timeout=HEARTBEAT)}\n\n".encode())
                 except queue.Empty:
-                    self.wfile.write(b": keep-alive\n\n")
+                    # A named event, not an SSE comment: the page never sees
+                    # comments, and it needs to hear something regularly to
+                    # know the link is still alive.
+                    self.wfile.write(b"event: ping\ndata: {}\n\n")
                 self.wfile.flush()
         except OSError:  # the page went away
             pass

@@ -17,6 +17,9 @@
     --accent: #2563eb;
     --button: #eceef2;
     --shadow: 0 10px 40px rgba(20, 22, 30, .12);
+    --ok: #15803d;
+    --warn: #b45309;
+    --bad: #dc2626;
     color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
@@ -29,6 +32,9 @@
       --accent: #5b8cff;
       --button: #24262e;
       --shadow: 0 10px 40px rgba(0, 0, 0, .5);
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --bad: #f87171;
       color-scheme: dark;
     }
   }
@@ -72,10 +78,46 @@
     font-size: 13px; color: var(--muted);
     margin-bottom: 14px; min-height: 18px;
   }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: #9ca3af; flex: none; }
-  .dot.live { background: #22c55e; }
-  .dot.down { background: #ef4444; }
   #source { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* connection status pill: pulses green only while the server is heard from */
+  .status {
+    --dot: var(--muted);
+    display: flex; align-items: center; gap: 7px; flex: none;
+    padding: 3px 10px 3px 8px; border-radius: 999px;
+    background: var(--button);
+    font-size: 12px; font-weight: 600;
+    transition: color .3s;
+  }
+  .status .dot {
+    position: relative;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--dot); transition: background .3s;
+  }
+  .status .dot::after {
+    content: ""; position: absolute; inset: 0;
+    border-radius: 50%; background: var(--dot); opacity: 0;
+  }
+  .status.online { --dot: var(--ok); color: var(--ok); }
+  .status.online .dot::after { animation: ripple 2s ease-out infinite; }
+  .status.connecting, .status.reconnecting { --dot: var(--warn); color: var(--warn); }
+  .status.connecting .dot, .status.reconnecting .dot { animation: blink 1s ease-in-out infinite alternate; }
+  .status.offline { --dot: var(--bad); color: var(--bad); }
+  @keyframes ripple {
+    0% { transform: scale(1); opacity: .7; }
+    70%, 100% { transform: scale(2.6); opacity: 0; }
+  }
+  @keyframes blink { to { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) {
+    .status .dot, .status .dot::after { animation: none !important; }
+  }
+
+  /* commands can't arrive while the link is down; say so without blocking them */
+  .transport, .volume, #seek, .times { transition: opacity .3s; }
+  body.disconnected .transport,
+  body.disconnected .volume,
+  body.disconnected #seek,
+  body.disconnected .times { opacity: .45; }
 
   .cover {
     position: relative;
@@ -184,8 +226,10 @@
 
 <main>
   <header>
-    <span class="dot" id="dot"></span>
-    <span id="source">Connecting…</span>
+    <span id="source">&nbsp;</span>
+    <span class="status connecting" id="link" role="status" aria-live="polite">
+      <span class="dot"></span><span id="linkText">Connecting…</span>
+    </span>
   </header>
 
   <div class="cover" id="cover">
@@ -305,10 +349,10 @@ function render() {
   const playing = s.status === "playing";
 
   // header: which app, and how we're talking to it
-  let source = s.app || (s.active ? "Unknown app" : "Nothing playing");
-  if (s.backend === "keys") source = "Media keys";
-  if (s.backend === "none") source = "No media control on this computer";
-  $("source").textContent = source;
+  let label = s.app || (s.active ? "Unknown app" : "Nothing playing");
+  if (s.backend === "keys") label = "Media keys";
+  if (s.backend === "none") label = "No media control on this computer";
+  $("source").textContent = label;
 
   // title / artist
   $("title").textContent = s.title || (s.active ? "Untitled" : "Nothing playing");
@@ -384,24 +428,70 @@ function tick() {
 setInterval(tick, 250);
 
 // ------------------------------------------------------------- live feed --
+// The server sends a snapshot on every change and a ping after 5 s of quiet,
+// so hearing nothing for longer means the link is dead even if the browser
+// hasn't noticed yet - a sleeping PC or a phone changing networks can leave
+// the connection looking open for minutes.
+const STALE_AFTER = 12000;    // silence that counts as a lost connection
+const OFFLINE_AFTER = 10000;  // reconnecting this long reads as "Offline"
+const RETRY_EVERY = 15000;    // while lost, start over this often
+
 let source = null;
+let lastHeard = 0;     // when the server was last heard from
+let lostSince = 0;     // when the link was lost; 0 while online
+let lastAttempt = 0;
+
+function setLink(status) {
+  const el = $("link");
+  if (el.dataset.status === status) return;
+  el.dataset.status = status;
+  el.className = `status ${status}`;
+  $("linkText").textContent = {
+    online: "Online", connecting: "Connecting…", reconnecting: "Reconnecting…", offline: "Offline",
+  }[status];
+  document.body.classList.toggle("disconnected", status !== "online");
+}
+
+function heard() {
+  lastHeard = performance.now();
+  lostSince = 0;
+  setLink("online");
+}
+
+function lost() {
+  const now = performance.now();
+  if (!lostSince) lostSince = now;
+  if (now - lostSince > OFFLINE_AFTER) setLink("offline");
+  else setLink(lastHeard ? "reconnecting" : "connecting");
+}
+
 function connect() {
   source?.close();
+  lastAttempt = performance.now();
   source = new EventSource(withToken("/api/events"));
-  source.onopen = () => { $("dot").className = "dot live"; };
+  source.onopen = heard;
+  source.addEventListener("ping", heard);
   source.onerror = () => {
-    $("dot").className = "dot down";
+    lost();
     if (source.readyState === EventSource.CLOSED) setTimeout(connect, 2000);
-    else $("source").textContent = "Reconnecting…";
   };
   source.onmessage = (event) => {
+    heard();
     state = JSON.parse(event.data);
     receivedAt = performance.now();
-    $("dot").className = "dot live";
     render();
   };
 }
 connect();
+
+setInterval(() => {
+  const now = performance.now();
+  if (!lostSince && lastHeard && now - lastHeard > STALE_AFTER) lost();
+  if (lostSince) {
+    lost();  // moves "Reconnecting…" on to "Offline" in time
+    if (now - lastAttempt > RETRY_EVERY || source.readyState === EventSource.CLOSED) connect();
+  }
+}, 1000);
 
 // Phones suspend background tabs and quietly drop the stream; pick it back up.
 document.addEventListener("visibilitychange", () => {
