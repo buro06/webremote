@@ -895,6 +895,24 @@ def lan_address() -> str:
         sock.close()
 
 
+def saved_token() -> str:
+    """A generated token, reused on every run so a bookmarked URL keeps
+    working after a restart. Delete the file to get a new one."""
+    path = HERE / ".webremote-token"
+    try:
+        token = path.read_text().strip()
+        if token:
+            return token
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(6)
+    try:
+        path.write_text(token + "\n")
+    except OSError:
+        pass  # still works, just not stable across restarts
+    return token
+
+
 def build(demo: bool, worker: Worker):
     if demo:
         return DemoMedia(), DemoVolume()
@@ -955,12 +973,16 @@ def check(remote: Remote) -> int:
 
 
 def main() -> int:
+    """Exit codes, which run.bat relies on: 0 = stopped on purpose (Ctrl+C),
+    2 = bad arguments or port in use (retrying won't help), anything else = a
+    fault worth restarting after."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--host", default="0.0.0.0", help="address to listen on (default: all)")
     parser.add_argument("--port", type=int, default=8765, help="port (default: 8765)")
     parser.add_argument("--token", nargs="?", const="", metavar="TOKEN",
-                        help="require ?t=TOKEN in the URL; give the flag alone to generate one")
+                        help="require ?t=TOKEN in the URL; give the flag alone to generate "
+                             "one (kept in .webremote-token, so bookmarks survive restarts)")
     parser.add_argument("--demo", action="store_true", help="use a simulated player")
     parser.add_argument("--check", action="store_true",
                         help="report what works here and exit (0 = everything)")
@@ -973,14 +995,14 @@ def main() -> int:
         return check(remote)
 
     if args.token == "":
-        args.token = secrets.token_urlsafe(6)
+        args.token = saved_token()
     Handler.remote, Handler.token, Handler.verbose = remote, args.token, args.verbose
 
     try:
         server = Server((args.host, args.port), Handler)
     except OSError as exc:
         print(f"Cannot listen on port {args.port}: {exc}. Try --port with another number.")
-        return 1
+        return 2  # like argparse's bad-arguments exit: run.bat does not retry these
 
     suffix = f"/?t={args.token}" if args.token else "/"
     print("webremote")

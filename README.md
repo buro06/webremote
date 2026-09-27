@@ -37,7 +37,24 @@ python -m venv .venv
 | `--verbose` | log every request |
 
 Without `--token`, anyone on your network who finds the port can control
-playback and volume.
+playback and volume. A generated token is saved in `.webremote-token` and
+reused on every run, so a bookmarked URL keeps working. Delete that file to
+get a new token.
+
+### Automatic restart
+
+`run.bat` watches the server and restarts it if it exits unexpectedly, such
+as after a Python traceback or a crash inside a Windows component. It waits
+3 s before restarting. If the server keeps failing within a minute of
+starting, the wait grows to 15 s and then 60 s.
+
+It won't restart when there's nothing a restart could fix:
+
+- you stopped it with Ctrl+C
+- a command-line option was wrong
+- the port is already in use
+
+`--check` and `--help` run once, as normal.
 
 ## What depends on what
 
