@@ -3,398 +3,493 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#101014">
+<meta name="theme-color" content="#101114">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<title>PC Remote</title>
+<title>webremote</title>
 <style>
   :root {
-    --bg: #101014;
-    --panel: #1b1b21;
-    --panel-hi: #26262e;
-    --text: #f2f2f5;
-    --muted: #8d8d99;
-    --accent: #4c8dff;
-    --ok: #35c46b;
-    --bad: #e5484d;
+    --bg: #f4f4f6;
+    --card: #ffffff;
+    --text: #15161a;
+    --muted: #6b6e78;
+    --track: #dcdde2;
+    --accent: #2563eb;
+    --button: #eceef2;
+    --shadow: 0 10px 40px rgba(20, 22, 30, .12);
+    color-scheme: light;
   }
-  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0c0d10;
+      --card: #17181d;
+      --text: #f1f2f5;
+      --muted: #9296a1;
+      --track: #2c2e36;
+      --accent: #5b8cff;
+      --button: #24262e;
+      --shadow: 0 10px 40px rgba(0, 0, 0, .5);
+      color-scheme: dark;
+    }
+  }
+
+  * { box-sizing: border-box; }
   html, body { height: 100%; }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--text);
-    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     display: flex;
+    align-items: center;
     justify-content: center;
-    padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom));
-    overscroll-behavior: none;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    -webkit-user-select: none;
   }
-  .app { width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 14px; }
+  button { font: inherit; color: inherit; }
 
-  header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .02em; color: var(--muted); }
-  .status { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); transition: background .2s; }
-  .status.online .dot { background: var(--ok); box-shadow: 0 0 0 0 rgba(53,196,107,.6); animation: pulse 2.4s infinite; }
-  .status.offline .dot { background: var(--bad); }
-  @keyframes pulse { 70% { box-shadow: 0 0 0 7px rgba(53,196,107,0); } 100% { box-shadow: 0 0 0 0 rgba(53,196,107,0); } }
-
-  .card { background: var(--panel); border-radius: 18px; padding: 16px; }
-
-  .art {
-    aspect-ratio: 1 / 1; width: 100%; border-radius: 14px; overflow: hidden;
-    background: var(--panel-hi) center/cover no-repeat;
-    display: flex; align-items: center; justify-content: center; margin-bottom: 16px;
+  .backdrop {
+    position: fixed; inset: -40px;
+    background: center / cover no-repeat;
+    filter: blur(40px) saturate(1.3);
+    opacity: 0; transition: opacity .6s;
+    z-index: -1;
   }
-  .art svg { width: 33%; height: 33%; opacity: .18; }
-  .art.has-art svg { display: none; }
+  .backdrop.shown { opacity: .35; }
 
-  .title { font-size: 19px; font-weight: 650; margin: 0 0 3px; }
-  .artist { color: var(--muted); font-size: 14px; margin: 0; }
-  .source { color: var(--muted); font-size: 11px; margin: 8px 0 0; text-transform: uppercase; letter-spacing: .06em; opacity: .7; }
-  .title, .artist, .source { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  main {
+    width: 100%; max-width: 400px;
+    background: var(--card);
+    border-radius: 24px;
+    box-shadow: var(--shadow);
+    padding: 20px;
+  }
 
-  .times { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
+  header {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--muted);
+    margin-bottom: 14px; min-height: 18px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #9ca3af; flex: none; }
+  .dot.live { background: #22c55e; }
+  .dot.down { background: #ef4444; }
+  #source { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+  .cover {
+    position: relative;
+    aspect-ratio: 1; width: 100%;
+    border-radius: 16px; overflow: hidden;
+    background: var(--button);
+    display: grid; place-items: center;
+  }
+  .cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .cover svg { width: 30%; height: 30%; fill: var(--muted); opacity: .5; }
+
+  .meta { margin: 18px 0 10px; min-height: 64px; }
+  #title {
+    font-size: 21px; font-weight: 650; letter-spacing: -.01em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #subtitle {
+    color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .notice { color: var(--muted); font-size: 14px; margin-top: 4px; }
+
+  /* sliders: native range inputs, with a filled portion drawn from --fill */
   input[type=range] {
-    -webkit-appearance: none; appearance: none; width: 100%; background: transparent; margin: 14px 0 0; height: 22px;
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 28px; margin: 0;
+    background: transparent; cursor: pointer;
+    --fill: 0%;
   }
-  input[type=range] { --pct: 0%; }
   input[type=range]::-webkit-slider-runnable-track {
     height: 6px; border-radius: 3px;
-    background: linear-gradient(var(--accent), var(--accent)) left/var(--pct) 100% no-repeat, var(--panel-hi);
+    background: linear-gradient(to right, var(--accent) var(--fill), var(--track) var(--fill));
   }
   input[type=range]::-moz-range-track {
     height: 6px; border-radius: 3px;
-    background: linear-gradient(var(--accent), var(--accent)) left/var(--pct) 100% no-repeat, var(--panel-hi);
+    background: linear-gradient(to right, var(--accent) var(--fill), var(--track) var(--fill));
   }
-  /* Plenty of players report a position but refuse seeks. Keep showing the
-     progress in that case - only the grab handle goes away. */
-  input[type=range].readonly { pointer-events: none; }
-  input[type=range].readonly::-webkit-slider-thumb { opacity: 0; }
-  input[type=range].readonly::-moz-range-thumb { opacity: 0; }
   input[type=range]::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--text);
-    margin-top: -6px; border: none;
+    -webkit-appearance: none; appearance: none;
+    width: 18px; height: 18px; margin-top: -6px;
+    border-radius: 50%; background: var(--text); border: 0;
+    transition: transform .1s;
   }
-  input[type=range]::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: var(--text); border: none; }
-  input[type=range]:disabled { opacity: .4; }
-
-  .transport { display: flex; align-items: center; justify-content: center; gap: 18px; margin-top: 14px; }
-  button {
-    border: none; background: var(--panel-hi); color: var(--text); border-radius: 50%;
-    width: 62px; height: 62px; display: grid; place-items: center; cursor: pointer;
-    transition: transform .08s ease, background .15s ease, opacity .15s;
+  input[type=range]::-moz-range-thumb {
+    width: 18px; height: 18px; border-radius: 50%; background: var(--text); border: 0;
   }
-  button:active { transform: scale(.92); background: #33333d; }
-  button:disabled { opacity: .35; cursor: default; }
-  button.primary { width: 78px; height: 78px; background: var(--accent); }
-  button.primary:active { background: #3f79dd; }
-  button svg { width: 26px; height: 26px; fill: currentColor; }
-  /* the `hidden` attribute has no effect on SVG elements, so hide by class */
-  .hide { display: none !important; }
-  button.primary svg { width: 32px; height: 32px; }
-  button.small { width: 46px; height: 46px; }
-  button.small svg { width: 20px; height: 20px; }
+  input[type=range]:active::-webkit-slider-thumb { transform: scale(1.25); }
+  input[type=range]:disabled { cursor: default; }
+  input[type=range]:disabled::-webkit-slider-thumb { opacity: 0; }
+  input[type=range]:disabled::-moz-range-thumb { opacity: 0; }
 
-  .volume { display: flex; align-items: center; gap: 12px; }
-  .volume input[type=range] { margin: 0; }
-  .vol-value { font-size: 12px; color: var(--muted); min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
-  .muted-on { color: var(--bad); }
+  .times {
+    display: flex; justify-content: space-between;
+    font-size: 12px; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    margin-top: -2px;
+  }
 
-  .note { text-align: center; font-size: 12px; color: var(--muted); min-height: 16px; }
+  .transport {
+    display: flex; align-items: center; justify-content: center; gap: 22px;
+    margin: 14px 0 18px;
+  }
+  .transport button, .volume button {
+    border: 0; background: none; padding: 0; cursor: pointer;
+    display: grid; place-items: center;
+    border-radius: 50%;
+    transition: transform .08s, background .15s;
+  }
+  .transport button:active, .volume button:active { transform: scale(.92); }
+  .transport svg, .volume svg { fill: currentColor; }
+  .skip { width: 60px; height: 60px; }
+  .skip svg { width: 34px; height: 34px; }
+  .skip:hover { background: var(--button); }
+  #playpause {
+    width: 76px; height: 76px;
+    background: var(--text); color: var(--card);
+  }
+  #playpause svg { width: 40px; height: 40px; }
+  button.dim { opacity: .35; }
+
+  .volume { display: flex; align-items: center; gap: 10px; }
+  .volume button { width: 40px; height: 40px; flex: none; }
+  .volume button:hover { background: var(--button); }
+  .volume svg { width: 24px; height: 24px; }
+  #volumeValue {
+    width: 3ch; text-align: right; flex: none;
+    font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  #volumeKeys { display: none; }
+  .keys-only #volume, .keys-only #volumeValue { display: none; }
+  .keys-only #volumeKeys { display: flex; gap: 10px; flex: 1; justify-content: flex-end; }
+
+  #toast {
+    position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom));
+    transform: translate(-50%, 20px);
+    background: var(--text); color: var(--card);
+    padding: 10px 16px; border-radius: 999px; font-size: 14px;
+    opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none;
+    max-width: calc(100% - 32px);
+  }
+  #toast.shown { opacity: 1; transform: translate(-50%, 0); }
 </style>
 </head>
 <body>
-<div class="app">
+<div class="backdrop" id="backdrop"></div>
+
+<main>
   <header>
-    <h1>PC Remote</h1>
-    <div class="status" id="status"><span class="dot"></span><span id="status-text">connecting…</span></div>
+    <span class="dot" id="dot"></span>
+    <span id="source">Connecting…</span>
   </header>
 
-  <section class="card">
-    <div class="art" id="art">
-      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>
-    </div>
-    <p class="title" id="title">Nothing playing</p>
-    <p class="artist" id="artist">—</p>
-    <p class="source" id="source"></p>
+  <div class="cover" id="cover">
+    <svg viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>
+  </div>
 
-    <input type="range" id="seek" min="0" max="100" value="0" step="0.1" disabled aria-label="Seek">
-    <div class="times"><span id="pos">0:00</span><span id="dur">0:00</span></div>
+  <div class="meta">
+    <div id="title">&nbsp;</div>
+    <div id="subtitle">&nbsp;</div>
+    <div class="notice" id="notice" hidden></div>
+  </div>
 
-    <div class="transport">
-      <button id="prev" aria-label="Previous track">
-        <svg viewBox="0 0 24 24"><path d="M6 6h2.5v12H6zM20 6v12L9.5 12z"/></svg>
-      </button>
-      <button id="playpause" class="primary" aria-label="Play or pause">
-        <svg id="icon-play" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>
-        <svg id="icon-pause" class="hide" viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>
-      </button>
-      <button id="next" aria-label="Next track">
-        <svg viewBox="0 0 24 24"><path d="M15.5 6H18v12h-2.5zM4 6v12l10.5-6z"/></svg>
-      </button>
-    </div>
-  </section>
+  <input type="range" id="seek" min="0" max="1" step="0.1" value="0" disabled aria-label="Position">
+  <div class="times"><span id="elapsed">–:––</span><span id="remaining">–:––</span></div>
 
-  <section class="card volume">
-    <button id="mute" class="small" aria-label="Mute">
-      <svg id="icon-vol" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg>
-      <svg id="icon-muted" class="hide" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4zm15.7 0.3l-1.4-1.4L16 10.2l-2.3-2.3-1.4 1.4 2.3 2.3-2.3 2.3 1.4 1.4 2.3-2.3 2.3 2.3 1.4-1.4-2.3-2.3z"/></svg>
+  <div class="transport">
+    <button class="skip" id="prev" aria-label="Previous track">
+      <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
     </button>
-    <input type="range" id="vol" min="0" max="100" value="0" aria-label="Volume">
-    <span class="vol-value" id="vol-value">—</span>
-  </section>
+    <button id="playpause" aria-label="Play or pause">
+      <svg viewBox="0 0 24 24"><path id="playIcon" d="M8 5v14l11-7z"/></svg>
+    </button>
+    <button class="skip" id="next" aria-label="Next track">
+      <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+    </button>
+  </div>
 
-  <p class="note" id="note"></p>
-</div>
+  <div class="volume" id="volumeRow">
+    <button id="mute" aria-label="Mute or unmute">
+      <svg viewBox="0 0 24 24"><path id="muteIcon"/></svg>
+    </button>
+    <input type="range" id="volume" min="0" max="100" step="1" value="0" disabled aria-label="Volume">
+    <span id="volumeValue"></span>
+    <div id="volumeKeys">
+      <button id="volDown" aria-label="Volume down">
+        <svg viewBox="0 0 24 24"><path d="M5 11h14v2H5z"/></svg>
+      </button>
+      <button id="volUp" aria-label="Volume up">
+        <svg viewBox="0 0 24 24"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>
+      </button>
+    </div>
+  </div>
+</main>
+
+<div id="toast"></div>
 
 <script>
-(() => {
-  const token = new URLSearchParams(location.search).get('t');
-  const qs = token ? '?t=' + encodeURIComponent(token) : '';
-  const $ = id => document.getElementById(id);
+"use strict";
 
-  const el = {
-    status: $('status'), statusText: $('status-text'), note: $('note'),
-    art: $('art'), title: $('title'), artist: $('artist'), source: $('source'),
-    seek: $('seek'), pos: $('pos'), dur: $('dur'),
-    prev: $('prev'), next: $('next'), playpause: $('playpause'),
-    iconPlay: $('icon-play'), iconPause: $('icon-pause'),
-    vol: $('vol'), volValue: $('vol-value'), mute: $('mute'),
-    iconVol: $('icon-vol'), iconMuted: $('icon-muted')
-  };
+const ICONS = {
+  play: "M8 5v14l11-7z",
+  pause: "M6 19h4V5H6v14zm8-14v14h4V5h-4z",
+  volume: "M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z",
+  muted: "M16.5 12A4.5 4.5 0 0 0 14 7.97v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.8 8.8 0 0 0 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3 3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 0 0 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4 9.91 6.09 12 8.18V4z",
+};
 
-  let state = null;
-  let failures = 0;
-  let holdSeek = 0;     // ignore server position right after a user seek
-  let holdVolume = 0;
-  let dragging = false;
-  let localPos = 0, localPosAt = 0;
-  let pending = null;   // {from, until}: optimistic play/pause icon after a tap
+const $ = (id) => document.getElementById(id);
+const token = new URLSearchParams(location.search).get("t");
+const withToken = (path) => token ? `${path}?t=${encodeURIComponent(token)}` : path;
 
-  const setFill = (input, fraction) => {
-    const pct = Math.max(0, Math.min(1, fraction || 0)) * 100;
-    input.style.setProperty('--pct', pct.toFixed(2) + '%');
-  };
+let state = null;          // last snapshot from the server
+let receivedAt = 0;        // performance.now() when it arrived
+let seeking = false;       // finger on the seek bar: don't move it under them
+let volumeHeldUntil = 0;   // ignore server volume briefly after local changes
+let playHeldUntil = 0;     // same for the optimistic play/pause icon
 
-  const fmt = s => {
-    if (s == null || !isFinite(s)) return '0:00';
-    s = Math.max(0, Math.round(s));
-    const m = Math.floor(s / 60), sec = String(s % 60).padStart(2, '0');
-    return m >= 60 ? `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
-  };
+// ---------------------------------------------------------------- helpers --
+function fmt(seconds) {
+  if (seconds == null || !isFinite(seconds)) return "–:––";
+  seconds = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(seconds / 3600), m = Math.floor(seconds / 60) % 60, s = seconds % 60;
+  const ss = String(s).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
+}
 
-  function setConnection(online, text) {
-    el.status.className = 'status ' + (online ? 'online' : 'offline');
-    el.statusText.textContent = text;
+function setFill(input) {
+  const span = input.max - input.min;
+  const pct = span > 0 ? ((input.value - input.min) / span) * 100 : 0;
+  input.style.setProperty("--fill", `${pct}%`);
+}
+
+let toastTimer;
+function toast(message) {
+  const el = $("toast");
+  el.textContent = message;
+  el.classList.add("shown");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("shown"), 2500);
+}
+
+async function post(path, body) {
+  try {
+    const res = await fetch(withToken(path), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) toast(data.error || "That didn't work");
+    return data;
+  } catch {
+    toast("Can't reach the PC");
+    return {};
+  }
+}
+
+function currentPosition() {
+  if (!state || state.position == null) return null;
+  let pos = state.position;
+  if (state.status === "playing") pos += (performance.now() - receivedAt) / 1000;
+  return Math.min(pos, state.duration ?? pos);
+}
+
+// ----------------------------------------------------------------- render --
+function render() {
+  const s = state;
+  const playing = s.status === "playing";
+
+  // header: which app, and how we're talking to it
+  let source = s.app || (s.active ? "Unknown app" : "Nothing playing");
+  if (s.backend === "keys") source = "Media keys";
+  if (s.backend === "none") source = "No media control on this computer";
+  $("source").textContent = source;
+
+  // title / artist
+  $("title").textContent = s.title || (s.active ? "Untitled" : "Nothing playing");
+  $("subtitle").textContent = [s.artist, s.album].filter(Boolean).join(" · ") || " ";
+
+  let notice = s.error || "";
+  if (!notice && s.backend === "keys")
+    notice = "Track info needs the Windows media packages - buttons still work.";
+  $("notice").textContent = notice;
+  $("notice").hidden = !notice;
+
+  // cover art
+  const cover = $("cover");
+  let img = cover.querySelector("img");
+  const artUrl = s.art ? withToken(`/api/art/${s.art}`) : null;
+  if (artUrl) {
+    if (!img) { img = new Image(); img.alt = ""; cover.appendChild(img); }
+    if (img.dataset.key !== s.art) { img.dataset.key = s.art; img.src = artUrl; }
+    $("backdrop").style.backgroundImage = `url("${artUrl}")`;
+    $("backdrop").classList.add("shown");
+  } else {
+    img?.remove();
+    $("backdrop").classList.remove("shown");
   }
 
-  async function api(path, options, params) {
-    const query = new URLSearchParams(params || {});
-    if (token) query.set('t', token);
-    const url = path + (query.toString() ? '?' + query : '');
-    const res = await fetch(url, Object.assign({ cache: 'no-store' }, options));
-    if (!res.ok) throw new Error(res.status === 401 ? 'unauthorized' : 'http ' + res.status);
-    return res.json();
-  }
+  // transport
+  if (performance.now() > playHeldUntil) setPlayIcon(playing);
+  $("prev").classList.toggle("dim", s.active && !s.can.prev);
+  $("next").classList.toggle("dim", s.active && !s.can.next);
 
-  function showPlaying(playing) {
-    el.iconPlay.classList.toggle('hide', playing);
-    el.iconPause.classList.toggle('hide', !playing);
-  }
-
-  async function send(action) {
-    // Flip the icon now rather than after the app gets round to reporting it;
-    // render() keeps it flipped until the real status catches up.
-    if (action === 'playpause' && state) {
-      pending = { from: state.status, until: Date.now() + 2500 };
-      showPlaying(state.status !== 'playing');
-    }
-    try {
-      const data = await api('/api/command', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action })
-      });
-      if (!data.ok && pending) { pending = null; if (state) render(state); }
-      // Live updates bring the new state as soon as the app reports it.
-      // Without them, look again a few times while the app catches up.
-      if (!(state && state.live)) [150, 500, 1000, 2000].forEach(d => setTimeout(tick, d));
-    } catch (e) {
-      pending = null;
-      if (state) render(state);
-      setConnection(false, 'disconnected');
-    }
-  }
-
-  async function volume(payload) {
-    holdVolume = Date.now() + 800;
-    try {
-      const data = await api('/api/volume', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (data.volume) renderVolume(data.volume, true);
-    } catch (e) { setConnection(false, 'disconnected'); }
-  }
-
-  function renderVolume(v, force) {
-    if (!force && Date.now() < holdVolume) return;
-    const on = v && v.available;
-    el.vol.disabled = !on;
-    if (on) {
-      if (!dragging) { el.vol.value = v.level; setFill(el.vol, v.level / 100); }
-      el.volValue.textContent = v.muted ? 'muted' : v.level + '%';
-      el.volValue.classList.toggle('muted-on', !!v.muted);
-      el.iconVol.classList.toggle('hide', !!v.muted);
-      el.iconMuted.classList.toggle('hide', !v.muted);
-    } else {
-      el.volValue.textContent = '—';
-    }
-  }
-
-  function render(s) {
-    state = s;
-    // A reading that still shows the status from before the tap is just the
-    // app being slow, so it does not undo the flipped icon.
-    if (pending && ((s.status !== pending.from && s.status !== 'changing') || Date.now() > pending.until)) {
-      pending = null;
-    }
-    if (!pending) showPlaying(s.status === 'playing');
-
-    el.title.textContent = s.title || (s.available ? 'Unknown track' : 'Nothing playing');
-    el.artist.textContent = s.artist || s.album || '—';
-    el.source.textContent = (s.app || '').replace(/\.exe$/i, '').replace(/!.*/, '');
-
-    const artUrl = s.art ? `/api/art/${s.art}${qs}` : null;
-    if (artUrl !== el.art.dataset.url) {
-      el.art.dataset.url = artUrl || '';
-      el.art.style.backgroundImage = artUrl ? `url("${artUrl}")` : 'none';
-      el.art.classList.toggle('has-art', !!artUrl);
-    }
-
-    // when there's no session at all, leave buttons live: media keys may still work
-    const c = s.controls || {};
-    el.prev.disabled = s.available && !c.prev;
-    el.next.disabled = s.available && !c.next;
-    el.playpause.disabled = s.available && !c.play && !c.pause;
-
-    // Show progress whenever we know the position; allow dragging only when
-    // the player says it accepts a seek.
-    el.seek.classList.toggle('readonly', !(s.duration != null && c.seek));
-    el.dur.textContent = fmt(s.duration);
-    if (s.duration != null) el.seek.max = s.duration;
-    if (s.duration == null) setFill(el.seek, 0);
-
-    if (Date.now() > holdSeek && s.position != null) {
-      localPos = s.position;
-      localPosAt = Date.now();
-      if (!dragging) {
-        el.seek.value = s.position;
-        el.pos.textContent = fmt(s.position);
-        setFill(el.seek, s.duration ? s.position / s.duration : 0);
-      }
-    } else if (s.position == null) {
-      el.pos.textContent = '0:00';
-      el.seek.value = 0;
-    }
-
-    let note = '';
-    if (s.error) note = s.error;
-    else if (!s.available) note = 'No app on the PC is registered as playing media.';
-    else if (s.backend === 'mediakeys') note = 'Media-key mode - no track info from this PC.';
-    if (!note && s.volume && s.volume.error) note = 'Volume unavailable: ' + s.volume.error;
-    el.note.textContent = note;
-  }
-
-  // smooth the progress bar between polls
-  setInterval(() => {
-    if (document.hidden) return;
-    if (!state || state.status !== 'playing' || dragging || state.duration == null) return;
-    const p = Math.min(state.duration, localPos + (Date.now() - localPosAt) / 1000);
-    el.seek.value = p;
-    el.pos.textContent = fmt(p);
-    setFill(el.seek, p / state.duration);
-  }, 500);
-
-  async function poll() {
-    // With live updates the server holds this request until something
-    // changes. The abort covers a request frozen while the phone slept.
-    const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), 20000);
-    const params = state && state.live && state.version != null ? { since: state.version } : null;
-    try {
-      const s = await api('/api/state', { signal: abort.signal }, params);
-      failures = 0;
-      setConnection(true, 'connected');
-      render(s);
-      renderVolume(s.volume);
-      return true;
-    } catch (e) {
-      if (++failures >= 2) {
-        setConnection(false, e.message === 'unauthorized' ? 'unauthorized' : 'disconnected');
-      }
-      return false;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  el.prev.addEventListener('click', () => send('prev'));
-  el.next.addEventListener('click', () => send('next'));
-  el.playpause.addEventListener('click', () => send('playpause'));
-  el.mute.addEventListener('click', () => volume({ mute: null }));
-
-  ['pointerdown', 'touchstart'].forEach(ev => {
-    el.seek.addEventListener(ev, () => { dragging = true; }, { passive: true });
-    el.vol.addEventListener(ev, () => { dragging = true; }, { passive: true });
-  });
-  el.seek.addEventListener('input', () => {
-    el.pos.textContent = fmt(+el.seek.value);
-    setFill(el.seek, +el.seek.value / (+el.seek.max || 1));
-  });
-  el.seek.addEventListener('change', async () => {
-    dragging = false;
-    holdSeek = Date.now() + 1200;
-    localPos = +el.seek.value; localPosAt = Date.now();
-    try {
-      await api('/api/seek', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ position: +el.seek.value })
-      });
-    } catch (e) { setConnection(false, 'disconnected'); }
-  });
-  el.vol.addEventListener('input', () => {
-    el.volValue.textContent = el.vol.value + '%';
-    setFill(el.vol, +el.vol.value / 100);
-  });
-  el.vol.addEventListener('change', () => { dragging = false; volume({ level: +el.vol.value }); });
-
-  // One request at a time, and none while the phone is asleep or the tab is in
-  // the background. With live updates the next request goes straight out and
-  // waits on the server; without them, poll only as fast as the state changes.
-  let pollTimer = null;
-  let polling = false;
-  async function tick() {
-    clearTimeout(pollTimer);
-    if (polling || document.hidden) return;
-    polling = true;
-    let ok;
-    try { ok = await poll(); } finally { polling = false; }
-    if (document.hidden) return;
-    const playing = state && state.status === 'playing';
-    const delay = !ok ? 2000 : state.live ? 0 : playing ? 1000 : 4000;
-    pollTimer = setTimeout(tick, delay);
-  }
-
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
-
+  // seek bar
+  const seek = $("seek");
+  // Without seek support the bar still shows progress, just with no handle.
+  seek.disabled = !(s.can.seek && s.duration);
+  if (s.duration) seek.max = s.duration;
   tick();
-})();
+
+  // volume
+  const v = s.volume || {};
+  document.body.classList.toggle("keys-only", !v.available);
+  if (performance.now() > volumeHeldUntil) showVolume(v.level, v.muted);
+}
+
+function setPlayIcon(playing) {
+  $("playIcon").setAttribute("d", playing ? ICONS.pause : ICONS.play);
+  $("playpause").setAttribute("aria-label", playing ? "Pause" : "Play");
+}
+
+function showVolume(level, muted) {
+  const slider = $("volume");
+  slider.disabled = level == null;
+  if (level != null) { slider.value = level; setFill(slider); }
+  $("volumeValue").textContent = level == null ? "" : (muted ? "–" : level);
+  $("muteIcon").setAttribute("d", muted ? ICONS.muted : ICONS.volume);
+  $("mute").setAttribute("aria-label", muted ? "Unmute" : "Mute");
+}
+
+// Position moves between snapshots, so advance it locally.
+function tick() {
+  if (!state || seeking) return;
+  const pos = currentPosition();
+  const seek = $("seek");
+  if (pos == null) {
+    seek.value = 0;
+    $("elapsed").textContent = $("remaining").textContent = "–:––";
+  } else {
+    seek.value = pos;
+    $("elapsed").textContent = fmt(pos);
+    $("remaining").textContent = "-" + fmt(state.duration - pos);
+  }
+  setFill(seek);
+}
+setInterval(tick, 250);
+
+// ------------------------------------------------------------- live feed --
+let source = null;
+function connect() {
+  source?.close();
+  source = new EventSource(withToken("/api/events"));
+  source.onopen = () => { $("dot").className = "dot live"; };
+  source.onerror = () => {
+    $("dot").className = "dot down";
+    if (source.readyState === EventSource.CLOSED) setTimeout(connect, 2000);
+    else $("source").textContent = "Reconnecting…";
+  };
+  source.onmessage = (event) => {
+    state = JSON.parse(event.data);
+    receivedAt = performance.now();
+    $("dot").className = "dot live";
+    render();
+  };
+}
+connect();
+
+// Phones suspend background tabs and quietly drop the stream; pick it back up.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && source?.readyState !== EventSource.OPEN) connect();
+});
+
+// --------------------------------------------------------------- controls --
+$("playpause").addEventListener("click", () => {
+  if (state) {
+    // Flip the icon now; the next snapshot confirms or corrects it.
+    const willPlay = state.status !== "playing";
+    setPlayIcon(willPlay);
+    playHeldUntil = performance.now() + 1500;
+    if (state.position != null) {
+      state.position = currentPosition();
+      receivedAt = performance.now();
+    }
+    state.status = willPlay ? "playing" : "paused";
+  }
+  post("/api/command", { action: "playpause" });
+});
+$("next").addEventListener("click", () => post("/api/command", { action: "next" }));
+$("prev").addEventListener("click", () => post("/api/command", { action: "prev" }));
+
+const seek = $("seek");
+seek.addEventListener("input", () => {
+  seeking = true;
+  setFill(seek);
+  $("elapsed").textContent = fmt(+seek.value);
+  if (state?.duration) $("remaining").textContent = "-" + fmt(state.duration - seek.value);
+});
+seek.addEventListener("change", async () => {
+  const target = +seek.value;
+  if (state) { state.position = target; receivedAt = performance.now(); }
+  seeking = false;
+  const res = await post("/api/seek", { position: target });
+  if (res.ok === false) toast("This app doesn't allow seeking");
+});
+
+// Volume: send while dragging, but no more than every 80 ms.
+const volume = $("volume");
+let volumeTimer = null, volumePending = null;
+function sendVolume() {
+  volumeTimer = null;
+  if (volumePending == null) return;
+  post("/api/volume", { level: volumePending });
+  volumePending = null;
+  volumeTimer = setTimeout(sendVolume, 80);
+}
+volume.addEventListener("input", () => {
+  volumeHeldUntil = performance.now() + 1500;
+  setFill(volume);
+  $("volumeValue").textContent = volume.value;
+  $("muteIcon").setAttribute("d", +volume.value === 0 ? ICONS.muted : ICONS.volume);
+  volumePending = +volume.value;
+  if (!volumeTimer) sendVolume();
+});
+
+$("mute").addEventListener("click", () => {
+  const v = state?.volume;
+  if (v?.available) {
+    v.muted = !v.muted;
+    volumeHeldUntil = performance.now() + 1500;
+    showVolume(v.level, v.muted);
+    post("/api/volume", { mute: v.muted });
+  } else {
+    post("/api/volume", { mute: null });  // media key: toggle, state unknown
+  }
+});
+$("volDown").addEventListener("click", () => post("/api/volume", { delta: -6 }));
+$("volUp").addEventListener("click", () => post("/api/volume", { delta: 6 }));
+
+// Keyboard, for when the page is open on another computer.
+document.addEventListener("keydown", (e) => {
+  if (e.target instanceof HTMLInputElement || e.metaKey || e.ctrlKey || e.altKey) return;
+  const actions = {
+    " ": () => $("playpause").click(),
+    "k": () => $("playpause").click(),
+    "ArrowRight": () => $("next").click(),
+    "ArrowLeft": () => $("prev").click(),
+    "ArrowUp": () => post("/api/volume", { delta: 5 }),
+    "ArrowDown": () => post("/api/volume", { delta: -5 }),
+    "m": () => $("mute").click(),
+  };
+  if (actions[e.key]) { e.preventDefault(); actions[e.key](); }
+});
+
+showVolume(null, false);
 </script>
 </body>
 </html>

@@ -1,17 +1,18 @@
 """
-webremote - control media playing on a Windows PC from your phone's browser.
+webremote - control whatever is playing on this Windows PC from a browser.
 
-Run on the Windows PC:
-    python webremote.py
-then open the printed http://<pc-ip>:8765 URL on any device on the same network.
+    python webremote.py              serve on http://<this-pc>:8765
+    python webremote.py --token      also require a random access token in the URL
+    python webremote.py --check      report which features work here, then exit
+    python webremote.py --demo       simulated player, to try the page on any OS
 
-Media info and transport control use the Windows "Global System Media Transport
-Controls" session (the same thing that powers the volume-key overlay), so it
-works with Spotify, YouTube in Chrome/Edge, VLC, Groove, iTunes, etc.
-Volume uses the system master volume via pycaw.
+Playback control, track info and seeking use the Windows media session API
+(the one behind the volume-key overlay), so it works with Spotify, browsers,
+VLC, Media Player and anything else that reports what it is playing. Volume is
+the system master volume, via pycaw.
 
-Both have fallbacks to virtual media keys, so the server still does something
-useful if the optional dependencies aren't installed.
+Both are optional. Without them the remote falls back to virtual media keys:
+the buttons still work, but there is no track info, seek bar or volume slider.
 """
 
 from __future__ import annotations
@@ -19,891 +20,983 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib
 import inspect
-import os
+import json
+import queue
 import secrets
-import logging
 import socket
 import sys
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeout
-from functools import wraps
-
-from flask import Flask, jsonify, request, send_from_directory, abort
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 IS_WINDOWS = sys.platform == "win32"
+HERE = Path(__file__).resolve().parent
+
+TICK = 0.25  # seconds between change checks while a page is open
+FULL_REFRESH = 3.0  # re-read everything at least this often, changed or not
+
 
 # --------------------------------------------------------------------------
 # optional dependencies
 # --------------------------------------------------------------------------
-# The Windows media-session bindings ship under two different distributions:
-#   winsdk                            - wheels for Python <= 3.12
-#   winrt-Windows.Media.Control[all]  - the successor, wheels for 3.13
-# The APIs we use are identical, so accept whichever one is installed.
-#
-# The [all] extra matters: a bare winrt-Windows.Media.Control pulls in only
-# winrt-runtime, leaving out the Windows.Foundation / Windows.Media packages
-# its types depend on, and the import then fails at runtime.
-MEDIA_FIX = 'pip install --only-binary=:all: "winrt-Windows.Media.Control[all]"'
-VOLUME_FIX = "pip install --only-binary=:all: pycaw"
+if IS_WINDOWS:
+    # comtypes (under pycaw) initialises COM on import. Make that the
+    # multithreaded apartment too, so no thread ends up in an STA by accident.
+    sys.coinit_flags = 0
 
-FORCE_MEDIA_KEYS = False  # set by --media-keys
+SessionManager = Buffer = DataReader = InputStreamOptions = None
+MEDIA_BINDING = None
+MEDIA_ERRORS: list[str] = []
 
-MediaManager = Buffer = DataReader = InputStreamOptions = None
-BINDING = None
-BINDING_ERRORS = []
-
-for _package in ("winsdk", "winrt"):
+# pywinrt ("winrt") is the maintained binding; winsdk is its predecessor and
+# exposes the same API, so either will do.
+for _package in ("winrt", "winsdk"):
     try:
-        _control = __import__(f"{_package}.windows.media.control", fromlist=["x"])
-        _streams = __import__(f"{_package}.windows.storage.streams", fromlist=["x"])
-        MediaManager = _control.GlobalSystemMediaTransportControlsSessionManager
+        _control = importlib.import_module(f"{_package}.windows.media.control")
+        _streams = importlib.import_module(f"{_package}.windows.storage.streams")
+        SessionManager = _control.GlobalSystemMediaTransportControlsSessionManager
         Buffer = _streams.Buffer
         DataReader = _streams.DataReader
         InputStreamOptions = _streams.InputStreamOptions
-        BINDING = _package
+        MEDIA_BINDING = _package
         break
-    except Exception as exc:  # not installed, incomplete install, or not Windows
-        BINDING_ERRORS.append(f"{_package}: {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        MEDIA_ERRORS.append(f"{_package}: {type(exc).__name__}: {exc}")
 
-HAVE_WINRT = BINDING is not None
-
-PYCAW_ERROR = None
+VOLUME_ERROR = None
 try:
-    from ctypes import POINTER, cast as ctypes_cast
+    from ctypes import POINTER, cast
 
     from comtypes import CLSCTX_ALL
     from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-
-    HAVE_PYCAW = True
-except Exception as exc:  # pragma: no cover
-    HAVE_PYCAW = False
-    PYCAW_ERROR = f"{type(exc).__name__}: {exc}"
+except Exception as exc:
+    VOLUME_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 # --------------------------------------------------------------------------
-# virtual key fallback (works on Windows even without winsdk/pycaw)
+# virtual media keys - the fallback for everything
 # --------------------------------------------------------------------------
-VK = {
-    "playpause": 0xB3,
-    "next": 0xB0,
-    "prev": 0xB1,
-    "stop": 0xB2,
-    "mute": 0xAD,
-    "voldown": 0xAE,
-    "volup": 0xAF,
-}
-KEYEVENTF_KEYUP = 0x0002
+VK = {"playpause": 0xB3, "next": 0xB0, "prev": 0xB1, "mute": 0xAD, "voldown": 0xAE, "volup": 0xAF}
 
 
 def tap_key(name: str) -> bool:
-    """Send a virtual key press/release. Returns True if it was sent."""
-    if not IS_WINDOWS or name not in VK:
+    if not IS_WINDOWS:
         return False
     import ctypes
 
-    code = VK[name]
-    ctypes.windll.user32.keybd_event(code, 0, 0, 0)
-    ctypes.windll.user32.keybd_event(code, 0, KEYEVENTF_KEYUP, 0)
+    ctypes.windll.user32.keybd_event(VK[name], 0, 0, 0)
+    ctypes.windll.user32.keybd_event(VK[name], 0, 2, 0)  # KEYEVENTF_KEYUP
     return True
 
 
 # --------------------------------------------------------------------------
-# a single worker thread owns every COM/WinRT object
+# the worker thread
 #
-# WinRT and COM interfaces are apartment-bound, and Flask serves requests from
-# a pool of threads. Funnelling all of it through one thread with one event
-# loop keeps things predictable.
+# Every WinRT and COM object is created and used on this one thread. The HTTP
+# server answers from many threads, and these objects are apartment-bound, so
+# requests hand their work over here instead of touching them directly.
 # --------------------------------------------------------------------------
-def init_apartment() -> str:
-    """Put the calling thread in the COM multi-threaded apartment.
+def join_mta() -> str:
+    """Put the calling thread in the COM multithreaded apartment.
 
-    This matters more than it looks. WinRT hands an async completion straight
-    to a thread in the MTA, but for a single-threaded apartment it posts the
-    completion to that thread's Windows message queue instead. This thread
-    runs an asyncio event loop, not a window message pump, so in an STA
-    nothing ever dispatches the completion and every await hangs forever.
-    comtypes.CoInitialize(), which this used to call, creates exactly that STA.
+    WinRT delivers async completions straight to MTA threads, but posts them to
+    an STA thread's window message queue. This thread runs an asyncio loop, not
+    a message pump, so in an STA every awaited WinRT call would hang forever.
     """
     if not IS_WINDOWS:
-        return "n/a (not Windows)"
+        return "n/a"
+    import ctypes
 
-    for module in ("winrt.runtime", "winsdk._winrt", "winsdk.system"):
-        try:
-            __import__(module, fromlist=["x"]).init_apartment()
-            break
-        except Exception:
-            continue
-
-    # Also the verification: CoInitializeEx reports RPC_E_CHANGED_MODE if the
-    # thread is already an STA, and otherwise joins/creates the MTA itself.
-    try:
-        import ctypes
-
-        COINIT_MULTITHREADED = 0x0
-        RPC_E_CHANGED_MODE = 0x80010106
-        hr = ctypes.windll.ole32.CoInitializeEx(None, COINIT_MULTITHREADED) & 0xFFFFFFFF
-        return "STA - async calls will hang" if hr == RPC_E_CHANGED_MODE else "MTA"
-    except Exception as exc:
-        return f"unknown ({type(exc).__name__}: {exc})"
+    hr = ctypes.windll.ole32.CoInitializeEx(None, 0) & 0xFFFFFFFF  # COINIT_MULTITHREADED
+    return "STA - media calls will hang" if hr == 0x80010106 else "MTA"  # RPC_E_CHANGED_MODE
 
 
 class Worker:
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
         self.apartment = "?"
-        self._ready = threading.Event()
-        threading.Thread(target=self._run, name="winrt-worker", daemon=True).start()
-        self._ready.wait(5)
+        ready = threading.Event()
 
-    def _run(self) -> None:
-        asyncio.set_event_loop(self.loop)
-        self.apartment = init_apartment()
-        self.loop.call_soon(self._ready.set)
-        self.loop.run_forever()
+        def run() -> None:
+            asyncio.set_event_loop(self.loop)
+            self.apartment = join_mta()
+            ready.set()
+            self.loop.run_forever()
 
-    def call(self, fn, *args, timeout=8, **kwargs):
-        """Run fn (sync or async) on the worker thread and wait for the result."""
+        threading.Thread(target=run, name="media-worker", daemon=True).start()
+        ready.wait(5)
+
+    def call(self, fn, *args, timeout: float = 5):
+        """Run fn (plain or async) on the worker and wait for its result."""
 
         async def runner():
-            result = fn(*args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
+            result = fn(*args)
+            return await result if inspect.isawaitable(result) else result
 
         future = asyncio.run_coroutine_threadsafe(runner(), self.loop)
         try:
-            return future.result(timeout=timeout)
+            return future.result(timeout)
         except FutureTimeout:
             future.cancel()
             raise
 
-
-worker = Worker()
+    def spawn(self, coro) -> None:
+        asyncio.run_coroutine_threadsafe(coro, self.loop)
 
 
 # --------------------------------------------------------------------------
-# media session
+# album art
 # --------------------------------------------------------------------------
-PLAYBACK_STATUS = {
-    0: "closed",
-    1: "opened",
-    2: "changing",
-    3: "stopped",
-    4: "playing",
-    5: "paused",
-}
+class ArtCache:
+    """Recent cover images, served to the page by content hash."""
 
-_manager = None
-_art_cache: dict[str, bytes] = {}
-_art_lock = threading.Lock()
-# Which art key belongs to which track, so a state read does not reopen and
-# reread the whole thumbnail every time.
-_track_art: dict[tuple, str] = {}
-
-
-async def _get_manager():
-    global _manager
-    if _manager is None:
-        _manager = await asyncio.wait_for(MediaManager.request_async(), 5)
-    return _manager
-
-
-class Changes:
-    """A counter bumped whenever the playback state moves, so a request can
-    wait on it instead of the page polling on a timer.
-    """
+    LIMIT = 16
 
     def __init__(self) -> None:
-        self.version = 0
-        self.live = False  # True once the watcher is running
-        self.last_wanted = 0.0  # monotonic time a page last asked
-        self._cond = threading.Condition()
+        self._items: dict[str, tuple[bytes, str]] = {}
+        self._lock = threading.Lock()
 
-    def bump(self, *_) -> None:
-        with self._cond:
-            self.version += 1
-            self._cond.notify_all()
-
-    def wait(self, since: int, timeout: float) -> int:
-        deadline = time.monotonic() + timeout
-        with self._cond:
-            while self.version == since:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._cond.wait(remaining)
-            return self.version
-
-
-changes = Changes()
-WATCH_INTERVAL = 0.25  # seconds between looks while a page is open
-WATCH_IDLE_AFTER = 15  # stop looking this long after the last page request
-
-
-async def _fingerprint() -> tuple:
-    """The cheap, synchronous parts of the state that show a change.
-
-    Deliberately not WinRT event subscriptions. Their handlers arrive on
-    Windows' own threads and need the GIL, which the worker holds while it is
-    blocked inside a call to the same session - after a pause that stalled the
-    worker, and every command queued behind it, until something timed out.
-    Reading the state on the worker itself cannot collide that way.
-    """
-    parts = []
-    session = await _current_session()
-    if session is not None:
-        try:
-            info = session.get_playback_info()
-            c = info.controls
-            parts += [session.source_app_user_model_id, int(info.playback_status),
-                      c.is_play_enabled, c.is_pause_enabled, c.is_next_enabled,
-                      c.is_previous_enabled, c.is_playback_position_enabled]
-        except Exception:
-            parts.append("?")
-        try:
-            # A new track or a seek shows up as a new length or a fresh update.
-            timeline = session.get_timeline_properties()
-            parts += [timeline.end_time.total_seconds(), timeline.last_updated_time.timestamp()]
-        except Exception:
-            pass
-    volume = read_volume()
-    parts += [volume["level"], volume["muted"]]
-    return tuple(parts)
-
-
-async def watch_changes() -> None:
-    last, idle = None, True
-    while True:
-        if time.monotonic() - changes.last_wanted > WATCH_IDLE_AFTER:
-            idle = True
-            await asyncio.sleep(1)
-            continue
-        if idle:
-            # Nothing was watched meanwhile, so a returning page's version
-            # proves nothing: wake it and start comparing from here.
-            idle, last = False, None
-            changes.bump()
-        try:
-            now = await asyncio.wait_for(_fingerprint(), 2)
-        except Exception:
-            now = None
-        if last is not None and now != last:
-            changes.bump()
-        last = now
-        await asyncio.sleep(WATCH_INTERVAL)
-
-
-def start_watching() -> None:
-    asyncio.run_coroutine_threadsafe(watch_changes(), worker.loop)
-    changes.live = True
-
-
-def _session_rank(session) -> int:
-    """Playing beats paused beats everything else."""
-    if session is None:
-        return -1
-    try:
-        return {4: 3, 5: 2}.get(int(session.get_playback_info().playback_status), 1)
-    except Exception:
-        return 0
-
-
-async def _current_session():
-    """The session worth showing.
-
-    Windows promotes whichever app last played to "current", which is almost
-    always the right answer and matches what the volume overlay shows. Only
-    when that session has closed or stopped do we scan the other registered
-    sessions for one that is playing.
-    """
-    if not HAVE_WINRT:
-        return None
-    try:
-        manager = await _get_manager()
-    except Exception:
-        return None
-
-    current = manager.get_current_session()
-    # Preferring *any* playing session over the current one lets a stale
-    # session that still claims to be playing hijack the display, which showed
-    # up as the pause button never flipping back after pausing a browser tab.
-    try:
-        if current is not None and int(current.get_playback_info().playback_status) not in (
-            0,  # closed
-            3,  # stopped
-        ):
-            return current
-    except Exception:
-        pass
-
-    best, best_rank = current, _session_rank(current)
-    try:
-        for candidate in manager.get_sessions():
-            rank = _session_rank(candidate)
-            if rank > best_rank:
-                best, best_rank = candidate, rank
-    except Exception:
-        pass
-    return best
-
-
-async def list_sessions() -> list:
-    """Every registered session and what it claims to support.
-
-    Apps vary wildly in how much of the media-session contract they implement,
-    so when a button does nothing this is the first thing to look at.
-    """
-    rows = []
-    try:
-        manager = await _get_manager()
-        current = manager.get_current_session()
-        current_id = getattr(current, "source_app_user_model_id", None)
-        for session in manager.get_sessions():
-            row = {"app": "?", "status": "?", "current": False, "title": None,
-                   "controls": {}, "duration": None}
-            try:
-                row["app"] = session.source_app_user_model_id
-                row["current"] = row["app"] == current_id
-            except Exception:
-                pass
-            try:
-                info = session.get_playback_info()
-                row["status"] = PLAYBACK_STATUS.get(int(info.playback_status), "?")
-                c = info.controls
-                row["controls"] = {
-                    "play": bool(c.is_play_enabled),
-                    "pause": bool(c.is_pause_enabled),
-                    "next": bool(c.is_next_enabled),
-                    "prev": bool(c.is_previous_enabled),
-                    "seek": bool(c.is_playback_position_enabled),
-                }
-            except Exception:
-                pass
-            try:
-                props = await asyncio.wait_for(session.try_get_media_properties_async(), 3)
-                row["title"] = props.title or None
-            except Exception:
-                pass
-            try:
-                row["duration"] = round(session.get_timeline_properties().end_time.total_seconds(), 1)
-            except Exception:
-                pass
-            rows.append(row)
-    except Exception:
-        pass
-    return rows
-
-
-async def _session_count() -> int:
-    try:
-        manager = await _get_manager()
-        return len(list(manager.get_sessions()))
-    except Exception:
-        return 0
-
-
-async def _thumbnail_bytes(props) -> bytes | None:
-    ref = getattr(props, "thumbnail", None)
-    if ref is None:
-        return None
-    try:
-        stream = await ref.open_read_async()
-        size = stream.size
-        if not size:
+    def put(self, data: bytes | None) -> str | None:
+        if not data:
             return None
-        buf = Buffer(size)
-        await stream.read_async(buf, size, InputStreamOptions.READ_AHEAD)
-        reader = DataReader.from_buffer(buf)
-        return bytes(reader.read_bytes(buf.length))
-    except Exception:
+        key = hashlib.sha1(data).hexdigest()[:16]
+        with self._lock:
+            if key not in self._items:
+                if len(self._items) >= self.LIMIT:
+                    self._items.pop(next(iter(self._items)))
+                self._items[key] = (data, sniff_image_type(data))
+        return key
+
+    def get(self, key: str) -> tuple[bytes, str] | None:
+        with self._lock:
+            return self._items.get(key)
+
+
+def sniff_image_type(data: bytes) -> str:
+    if data.startswith(b"\x89PNG"):
+        return "image/png"
+    if data.startswith(b"<svg"):
+        return "image/svg+xml"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+art = ArtCache()
+
+
+# --------------------------------------------------------------------------
+# Windows media session
+# --------------------------------------------------------------------------
+STATUS = {0: "closed", 1: "opened", 2: "changing", 3: "stopped", 4: "playing", 5: "paused"}
+PLAYING, PAUSED = 4, 5
+
+KNOWN_APPS = {
+    "spotify": "Spotify",
+    "chrome": "Chrome",
+    "msedge": "Edge",
+    "firefox": "Firefox",
+    "opera": "Opera",
+    "brave": "Brave",
+    "vlc": "VLC",
+    "zunemusic": "Media Player",
+    "zunevideo": "Films & TV",
+    "itunes": "iTunes",
+    "applemusic": "Apple Music",
+    "foobar2000": "foobar2000",
+    "musicbee": "MusicBee",
+    "tidal": "TIDAL",
+    "deezer": "Deezer",
+    "plex": "Plex",
+}
+
+
+def app_name(aumid: str | None) -> str | None:
+    """A readable name from an app user model id like 'Spotify.exe' or
+    'Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic'."""
+    if not aumid:
         return None
+    lowered = aumid.lower()
+    for needle, label in KNOWN_APPS.items():
+        if needle in lowered:
+            return label
+    # Firefox registers under a hash of its install folder.
+    if len(aumid) == 16 and all(c in "0123456789ABCDEF" for c in aumid):
+        return "Firefox"
+    name = aumid.split("!")[-1].replace("\\", "/").split("/")[-1]
+    return name[:-4] if name.lower().endswith(".exe") else name
 
 
-def _cache_art(data: bytes | None) -> str | None:
-    if not data:
-        return None
-    key = hashlib.sha1(data).hexdigest()[:16]
-    with _art_lock:
-        if key not in _art_cache:
-            # keep the cache tiny; only recent covers matter
-            if len(_art_cache) > 8:
-                _art_cache.clear()
-                _track_art.clear()
-            _art_cache[key] = data
-    return key
-
-
-async def read_state() -> dict:
-    state = {
-        "available": False,
-        "backend": "session" if HAVE_WINRT else ("mediakeys" if IS_WINDOWS else "none"),
+def empty_state(backend: str) -> dict:
+    return {
+        "backend": backend,
+        "active": False,
+        "app": None,
         "status": "closed",
         "title": None,
         "artist": None,
         "album": None,
-        "app": None,
+        "art": None,
         "position": None,
         "duration": None,
-        "art": None,
-        "controls": {"play": True, "pause": True, "next": True, "prev": True, "seek": False},
+        "can": {"play": True, "pause": True, "next": True, "prev": True, "seek": False},
     }
 
-    session = await _current_session()
-    if session is None:
-        return state
 
-    state["available"] = True
-    try:
-        state["app"] = session.source_app_user_model_id
-    except Exception:
-        pass
+class WindowsMedia:
+    """Reads and drives the media session Windows considers current.
 
-    try:
-        info = session.get_playback_info()
-        state["status"] = PLAYBACK_STATUS.get(int(info.playback_status), "unknown")
-        controls = info.controls
-        state["controls"] = {
-            "play": bool(controls.is_play_enabled),
-            "pause": bool(controls.is_pause_enabled),
-            "next": bool(controls.is_next_enabled),
-            "prev": bool(controls.is_previous_enabled),
-            "seek": bool(controls.is_playback_position_enabled),
-        }
-    except Exception:
-        pass
-
-    try:
-        props = await asyncio.wait_for(session.try_get_media_properties_async(), 5)
-        state["title"] = props.title or None
-        state["artist"] = props.artist or None
-        state["album"] = props.album_title or None
-        track = (state["app"], state["title"], state["artist"], state["album"])
-        state["art"] = _track_art.get(track)
-        if state["art"] is None:
-            # Only a found cover is remembered, so a late one still turns up.
-            state["art"] = _cache_art(await _thumbnail_bytes(props))
-            if state["art"] is not None:
-                if len(_track_art) > 8:
-                    _track_art.clear()
-                _track_art[track] = state["art"]
-    except Exception:
-        pass
-
-    try:
-        timeline = session.get_timeline_properties()
-        position = timeline.position.total_seconds()
-        duration = timeline.end_time.total_seconds()
-        if state["status"] == "playing":
-            # Position only changes on events, so extrapolate to "now". Some
-            # players (browsers especially) go a long time between updates; if
-            # the last one predates the whole track the reading is stale rather
-            # than merely old, so leave it alone instead of running off the end.
-            updated = timeline.last_updated_time
-            if updated and updated.timestamp() > 0:
-                elapsed = max(0.0, time.time() - updated.timestamp())
-                if elapsed <= duration:
-                    position += elapsed
-        if duration > 0:
-            state["position"] = round(min(position, duration), 1)
-            state["duration"] = round(duration, 1)
-    except Exception:
-        pass
-
-    return state
-
-
-async def do_command(action: str) -> str | None:
-    """Transport control. Returns which route worked, or None if neither did.
-
-    Prefers the media session, since it addresses one specific app. Media keys
-    go to whatever Windows decides, which is a blunter instrument but reaches
-    apps whose session ignores commands.
+    Changes are found by polling cheap synchronous reads, deliberately not by
+    subscribing to WinRT events: those handlers arrive on Windows' own threads
+    and need the GIL, which the worker may hold while blocked in a call to the
+    same session, and the two then wait on each other.
     """
-    session = None if FORCE_MEDIA_KEYS else await _current_session()
-    if session is not None:
+
+    backend = "session"
+
+    def __init__(self) -> None:
+        self._manager = None
+        self._track_art: dict[tuple, str] = {}
+
+    async def _session(self):
+        if self._manager is None:
+            self._manager = await asyncio.wait_for(SessionManager.request_async(), 5)
+        manager = self._manager
+
+        # Windows promotes whichever app last played to "current", which is
+        # nearly always right and matches the volume overlay. Only when that
+        # one has closed or stopped, look for another that is still going.
+        # (Preferring *any* playing session lets a stale one that never
+        # reported its pause hijack the remote.)
+        current = manager.get_current_session()
+        if current is not None and _status(current) not in (0, 3):
+            return current
+
+        best, best_rank = current, _rank(current)
+        for session in manager.get_sessions():
+            if _rank(session) > best_rank:
+                best, best_rank = session, _rank(session)
+        return best
+
+    async def fingerprint(self) -> tuple:
+        """The parts of the state that are cheap to read and show a change."""
+        session = await self._session()
+        if session is None:
+            return (None,)
+        info = session.get_playback_info()
+        c = info.controls
+        timeline = session.get_timeline_properties()
+        return (
+            session.source_app_user_model_id,
+            int(info.playback_status),
+            c.is_play_enabled, c.is_pause_enabled, c.is_next_enabled,
+            c.is_previous_enabled, c.is_playback_position_enabled,
+            # A new track or a seek shows up as a new length or a fresh update.
+            timeline.end_time.total_seconds(),
+            _timestamp(timeline.last_updated_time),
+        )
+
+    async def state(self) -> dict:
+        state = empty_state(self.backend)
+        session = await self._session()
+        if session is None:
+            return state
+
+        state["active"] = True
+        state["app"] = app_name(session.source_app_user_model_id)
+
+        info = session.get_playback_info()
+        state["status"] = STATUS.get(int(info.playback_status), "unknown")
+        c = info.controls
+        state["can"] = {
+            "play": bool(c.is_play_enabled),
+            "pause": bool(c.is_pause_enabled),
+            "next": bool(c.is_next_enabled),
+            "prev": bool(c.is_previous_enabled),
+            "seek": bool(c.is_playback_position_enabled),
+        }
+
         try:
-            # An explicit play/pause is honoured by more apps than the toggle,
-            # so aim for the state we want and keep the toggle as a backup.
-            if action == "playpause":
-                playing = int(session.get_playback_info().playback_status) == 4
-                attempts = [session.try_pause_async if playing else session.try_play_async,
-                            session.try_toggle_play_pause_async]
-            else:
-                attempts = [{
-                    "play": session.try_play_async,
-                    "pause": session.try_pause_async,
-                    "next": session.try_skip_next_async,
-                    "prev": session.try_skip_previous_async,
-                    "stop": session.try_stop_async,
-                }[action]]
-            for attempt in attempts:
-                if await asyncio.wait_for(attempt(), 4):
-                    return "session"
+            props = await asyncio.wait_for(session.try_get_media_properties_async(), 3)
+            state["title"] = props.title or None
+            state["artist"] = props.artist or props.album_artist or None
+            state["album"] = props.album_title or None
+            state["art"] = await self._art_for(state, props)
         except Exception:
             pass
 
-    key = {"play": "playpause", "pause": "playpause"}.get(action, action)
-    return "mediakey" if tap_key(key) else None
+        try:
+            timeline = session.get_timeline_properties()
+            start = timeline.start_time.total_seconds()
+            duration = timeline.end_time.total_seconds() - start
+        except Exception:
+            duration = 0
+        if duration > 0:
+            position = timeline.position.total_seconds() - start
+            if state["status"] == "playing":
+                # Apps report position only now and then; carry it forward to
+                # now. An update older than the whole track is stale rather
+                # than merely old, so leave that one alone.
+                elapsed = time.time() - _timestamp(timeline.last_updated_time)
+                if 0 < elapsed <= duration:
+                    position += elapsed
+            state["position"] = round(max(0.0, min(position, duration)), 2)
+            state["duration"] = round(duration, 2)
+        else:
+            state["can"]["seek"] = False
+        return state
+
+    async def _art_for(self, state: dict, props) -> str | None:
+        track = (state["app"], state["title"], state["artist"], state["album"])
+        if track in self._track_art:
+            return self._track_art[track]
+        key = art.put(await _read_thumbnail(props))
+        if key is not None:  # remember only a found cover, so a late one still turns up
+            if len(self._track_art) > 32:
+                self._track_art.clear()
+            self._track_art[track] = key
+        return key
+
+    async def command(self, action: str) -> str | None:
+        """Returns how the command was delivered, or None if it could not be."""
+        try:
+            session = await self._session()
+        except Exception:
+            session = None
+
+        if session is not None:
+            if action == "playpause":
+                # More apps honour an explicit play or pause than the toggle,
+                # so ask for the state we want and keep the toggle as backup.
+                if _status(session) == PLAYING:
+                    attempts = [session.try_pause_async, session.try_toggle_play_pause_async]
+                else:
+                    attempts = [session.try_play_async, session.try_toggle_play_pause_async]
+            else:
+                attempts = [{"next": session.try_skip_next_async,
+                             "prev": session.try_skip_previous_async}[action]]
+            for attempt in attempts:
+                try:
+                    if await asyncio.wait_for(attempt(), 3):
+                        return "session"
+                except Exception:
+                    pass
+
+        return "key" if tap_key(action) else None
+
+    async def seek(self, seconds: float) -> bool:
+        session = await self._session()
+        if session is None:
+            return False
+        start = session.get_timeline_properties().start_time.total_seconds()
+        ticks = int((start + max(0.0, seconds)) * 10_000_000)  # 100 ns units
+        return bool(await asyncio.wait_for(session.try_change_playback_position_async(ticks), 3))
+
+    async def sessions(self) -> list[dict]:
+        """Every registered session, for --check. When a button does nothing
+        in some app, this shows what that app claims to support."""
+        await self._session()
+        current = self._manager.get_current_session()
+        current_id = current.source_app_user_model_id if current else None
+        rows = []
+        for session in self._manager.get_sessions():
+            c = session.get_playback_info().controls
+            rows.append({
+                "app": session.source_app_user_model_id,
+                "current": session.source_app_user_model_id == current_id,
+                "status": STATUS.get(_status(session), "?"),
+                "supports": [name for name, ok in (
+                    ("play", c.is_play_enabled), ("pause", c.is_pause_enabled),
+                    ("next", c.is_next_enabled), ("prev", c.is_previous_enabled),
+                    ("seek", c.is_playback_position_enabled)) if ok],
+            })
+        return rows
 
 
-async def do_seek(seconds: float) -> bool:
-    session = await _current_session()
-    if session is None:
-        return False
+def _status(session) -> int:
     try:
-        # WinRT playback position is in 100-nanosecond ticks
-        return bool(await session.try_change_playback_position_async(int(seconds * 10_000_000)))
+        return int(session.get_playback_info().playback_status)
     except Exception:
+        return -1
+
+
+def _rank(session) -> int:
+    """Playing beats paused beats everything else."""
+    if session is None:
+        return -1
+    return {PLAYING: 3, PAUSED: 2}.get(_status(session), 1)
+
+
+def _timestamp(value) -> float:
+    try:
+        return value.timestamp()
+    except Exception:
+        return 0.0
+
+
+async def _read_thumbnail(props) -> bytes | None:
+    ref = getattr(props, "thumbnail", None)
+    if ref is None:
+        return None
+    try:
+        stream = await asyncio.wait_for(ref.open_read_async(), 3)
+        size = int(stream.size)
+        if not 0 < size < 10_000_000:
+            return None
+        try:
+            buf = await asyncio.wait_for(
+                stream.read_async(Buffer(size), size, InputStreamOptions.READ_AHEAD), 3)
+        finally:
+            stream.close()
+    except Exception:
+        return None
+
+    # How bytes come out of an IBuffer differs between binding versions.
+    try:
+        return bytes(memoryview(buf))  # pywinrt 2+: buffers support the buffer protocol
+    except TypeError:
+        pass
+    reader = DataReader.from_buffer(buf)
+    try:
+        out = bytearray(buf.length)  # pywinrt: fills a caller-supplied buffer
+        reader.read_bytes(out)
+        return bytes(out)
+    except TypeError:
+        return bytes(reader.read_bytes(buf.length))  # winsdk: returns the bytes
+
+
+class MediaKeysOnly:
+    """No media session binding: send keys and report nothing."""
+
+    backend = "keys" if IS_WINDOWS else "none"
+
+    async def fingerprint(self) -> tuple:
+        return ()
+
+    async def state(self) -> dict:
+        return empty_state(self.backend)
+
+    async def command(self, action: str) -> str | None:
+        return "key" if tap_key(action) else None
+
+    async def seek(self, seconds: float) -> bool:
         return False
 
 
 # --------------------------------------------------------------------------
 # system volume
 # --------------------------------------------------------------------------
-_endpoint = None
+class WindowsVolume:
+    """Master volume of the default output device - the tray slider, not a
+    per-app volume."""
+
+    REFRESH = 3.0  # re-acquire the device this often, to follow a switch to headphones
+
+    def __init__(self) -> None:
+        self._endpoint = None
+        self._acquired = 0.0
+
+    def _device(self):
+        if self._endpoint is None or time.monotonic() - self._acquired > self.REFRESH:
+            speakers = AudioUtilities.GetSpeakers()
+            if hasattr(speakers, "EndpointVolume"):  # pycaw 2023+
+                self._endpoint = speakers.EndpointVolume
+            else:  # older pycaw hands back the raw IMMDevice
+                iface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                self._endpoint = cast(iface, POINTER(IAudioEndpointVolume))
+            self._acquired = time.monotonic()
+        return self._endpoint
+
+    def get(self) -> dict:
+        try:
+            device = self._device()
+            return {"available": True,
+                    "level": round(device.GetMasterVolumeLevelScalar() * 100),
+                    "muted": bool(device.GetMute())}
+        except Exception as exc:
+            self._endpoint = None
+            return {"available": False, "level": None, "muted": None,
+                    "error": f"{type(exc).__name__}: {exc}"}
+
+    def set(self, level: float) -> bool:
+        device = self._device()
+        device.SetMasterVolumeLevelScalar(max(0.0, min(100.0, level)) / 100, None)
+        if level > 0 and device.GetMute():
+            device.SetMute(False, None)  # dragging up from silence should be heard
+        return True
+
+    def nudge(self, delta: float) -> bool:
+        return self.set(self.get()["level"] + delta)
+
+    def mute(self, muted: bool | None) -> bool:
+        device = self._device()
+        device.SetMute(not device.GetMute() if muted is None else bool(muted), None)
+        return True
 
 
-def _volume_endpoint():
-    """The master volume of the default output device - the Windows volume.
+class VolumeKeysOnly:
+    """No pycaw: volume keys work, but there is no level to read or set."""
 
-    This is the endpoint volume, the same one the tray slider and the volume
-    keys move. It is deliberately not a per-application session volume.
+    def get(self) -> dict:
+        return {"available": False, "level": None, "muted": None, "keys": IS_WINDOWS,
+                "error": VOLUME_ERROR}
+
+    def set(self, level: float) -> bool:
+        return False
+
+    def nudge(self, delta: float) -> bool:
+        key = "volup" if delta > 0 else "voldown"
+        return all(tap_key(key) for _ in range(max(1, round(abs(delta) / 2))))  # ~2% a press
+
+    def mute(self, muted: bool | None) -> bool:
+        return tap_key("mute")  # toggle only; the current state is unknown
+
+
+# --------------------------------------------------------------------------
+# demo backend - a pretend player, for trying the page on any machine
+# --------------------------------------------------------------------------
+class DemoMedia:
+    backend = "demo"
+    TRACKS = [
+        ("Northern Lights", "Aurora Quartet", "Night Drive", 214, ("#1e3a8a", "#22d3ee")),
+        ("Paper Boats", "The Tidewater", "Low Tide", 187, ("#7c2d12", "#fbbf24")),
+        ("Glasshouse", "Mira Vale", "Greenroom Sessions", 251, ("#14532d", "#a3e635")),
+    ]
+
+    def __init__(self) -> None:
+        self.index = 0
+        self.playing = True
+        self.offset = 0.0
+        self.since = time.monotonic()
+        self.covers = [art.put(self._cover(*t[4], t[0])) for t in self.TRACKS]
+
+    @staticmethod
+    def _cover(dark: str, light: str, title: str) -> bytes:
+        return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300">'
+                f'<defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="{dark}"/>'
+                f'<stop offset="1" stop-color="{light}"/></linearGradient></defs>'
+                f'<rect width="300" height="300" fill="url(#g)"/>'
+                f'<circle cx="210" cy="95" r="48" fill="#fff" opacity=".18"/>'
+                f'<text x="24" y="270" font-family="sans-serif" font-size="26" '
+                f'font-weight="700" fill="#fff">{title}</text></svg>').encode()
+
+    def _position(self) -> float:
+        pos = self.offset + (time.monotonic() - self.since if self.playing else 0.0)
+        duration = self.TRACKS[self.index][3]
+        if pos >= duration:  # roll on to the next track
+            self._load((self.index + 1) % len(self.TRACKS))
+            return 0.0
+        return pos
+
+    def _load(self, index: int, offset: float = 0.0) -> None:
+        self.index, self.offset, self.since = index, offset, time.monotonic()
+
+    async def fingerprint(self) -> tuple:
+        self._position()
+        return (self.index, self.playing, round(self.offset, 2))
+
+    async def state(self) -> dict:
+        title, artist, album, duration, _ = self.TRACKS[self.index]
+        state = empty_state(self.backend)
+        state.update(active=True, app="Demo Player", title=title, artist=artist, album=album,
+                     art=self.covers[self.index], status="playing" if self.playing else "paused",
+                     position=round(self._position(), 2), duration=duration)
+        state["can"]["seek"] = True
+        return state
+
+    async def command(self, action: str) -> str:
+        if action == "playpause":
+            self._load(self.index, self._position())
+            self.playing = not self.playing
+        elif action == "next":
+            self._load((self.index + 1) % len(self.TRACKS))
+        elif action == "prev":
+            # Like most players: restart the track, unless it has only just begun.
+            back = self._position() < 3
+            self._load((self.index - back) % len(self.TRACKS))
+        return "demo"
+
+    async def seek(self, seconds: float) -> bool:
+        self._load(self.index, max(0.0, min(seconds, self.TRACKS[self.index][3] - 1)))
+        return True
+
+
+class DemoVolume:
+    def __init__(self) -> None:
+        self.level, self.muted = 40, False
+
+    def get(self) -> dict:
+        return {"available": True, "level": self.level, "muted": self.muted}
+
+    def set(self, level: float) -> bool:
+        self.level = round(max(0.0, min(100.0, level)))
+        self.muted = self.muted and self.level == 0
+        return True
+
+    def nudge(self, delta: float) -> bool:
+        return self.set(self.level + delta)
+
+    def mute(self, muted: bool | None) -> bool:
+        self.muted = (not self.muted) if muted is None else bool(muted)
+        return True
+
+
+# --------------------------------------------------------------------------
+# live updates
+# --------------------------------------------------------------------------
+class Remote:
+    """Owns the backends and pushes state to every open page.
+
+    While at least one page is connected, a loop on the worker compares a cheap
+    fingerprint every TICK and sends a full snapshot when it moves, so pages
+    hear about a pause or a track change within a quarter second. With no page
+    open it does nothing.
     """
-    global _endpoint
-    if _endpoint is not None:
-        return _endpoint
 
-    speakers = AudioUtilities.GetSpeakers()
-    if hasattr(speakers, "EndpointVolume"):
-        # pycaw >= 2023 returns an AudioDevice wrapper that activates for us
-        _endpoint = speakers.EndpointVolume
-    else:
-        # older pycaw handed back the raw IMMDevice pointer
-        interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        _endpoint = ctypes_cast(interface, POINTER(IAudioEndpointVolume))
-    return _endpoint
+    def __init__(self, media, volume, worker: Worker) -> None:
+        self.media, self.volume, self.worker = media, volume, worker
+        self._clients: set[queue.Queue] = set()
+        self._lock = threading.Lock()
+        self._latest: str | None = None
+        self._wake: asyncio.Event | None = None
+        self._force = False
+        worker.spawn(self._watch())
 
+    # -- called from HTTP threads ---------------------------------------
+    def subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=8)
+        with self._lock:
+            self._clients.add(q)
+            if self._latest:
+                q.put_nowait(self._latest)
+        self.refresh()
+        return q
 
-def read_volume() -> dict:
-    if not HAVE_PYCAW:
-        return {"available": False, "level": None, "muted": None,
-                "error": PYCAW_ERROR or "pycaw not installed"}
-    try:
-        endpoint = _volume_endpoint()
-        return {
-            "available": True,
-            "level": round(endpoint.GetMasterVolumeLevelScalar() * 100),
-            "muted": bool(endpoint.GetMute()),
-        }
-    except Exception as exc:
-        # Installed but not usable - say why instead of just greying the slider.
-        return {"available": False, "level": None, "muted": None,
-                "error": f"{type(exc).__name__}: {exc}"}
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._lock:
+            self._clients.discard(q)
 
+    def refresh(self) -> None:
+        """Push a fresh snapshot now rather than at the next change."""
+        self._force = True
+        if self._wake is not None:
+            self.worker.loop.call_soon_threadsafe(self._wake.set)
 
-def set_volume(level: float) -> bool:
-    level = max(0.0, min(100.0, float(level)))
-    if HAVE_PYCAW:
+    def run(self, fn, *args, timeout: float = 5):
+        return self.worker.call(fn, *args, timeout=timeout)
+
+    # -- on the worker ----------------------------------------------------
+    async def snapshot(self) -> dict:
         try:
-            _volume_endpoint().SetMasterVolumeLevelScalar(level / 100.0, None)
-            return True
-        except Exception:
-            pass
-    return False
+            state = await asyncio.wait_for(self.media.state(), 5)
+        except Exception as exc:
+            # A wedged media session must not take the page down with it.
+            state = empty_state(self.media.backend)
+            state["error"] = f"Media session not responding ({type(exc).__name__})"
+        state["volume"] = self.volume.get()
+        return state
 
-
-def nudge_volume(delta: float) -> bool:
-    if HAVE_PYCAW:
-        current = read_volume()
-        if current["available"]:
-            return set_volume(current["level"] + delta)
-    # each media key step is ~2%
-    key = "volup" if delta > 0 else "voldown"
-    sent = False
-    for _ in range(max(1, int(abs(delta) / 2))):
-        sent = tap_key(key) or sent
-    return sent
-
-
-def set_mute(muted: bool | None) -> bool:
-    if HAVE_PYCAW:
+    async def _fingerprint(self) -> tuple | None:
         try:
-            endpoint = _volume_endpoint()
-            value = (not endpoint.GetMute()) if muted is None else bool(muted)
-            endpoint.SetMute(value, None)
-            return True
+            media = await asyncio.wait_for(self.media.fingerprint(), 2)
         except Exception:
+            media = None
+        volume = self.volume.get()
+        return media, volume["level"], volume["muted"]
+
+    def _publish(self, payload: str) -> None:
+        with self._lock:
+            self._latest = payload
+            for q in self._clients:
+                if q.full():  # a page that stopped reading only needs the newest
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                q.put_nowait(payload)
+
+    async def _watch(self) -> None:
+        self._wake = asyncio.Event()
+        last, last_full = None, 0.0
+        while True:
+            if not self._clients:
+                last = None
+                await self._sleep(1.0)
+                continue
+            now = await self._fingerprint()
+            force, self._force = self._force, False
+            if force or now != last or time.monotonic() - last_full > FULL_REFRESH:
+                self._publish(json.dumps(await self.snapshot()))
+                last, last_full = now, time.monotonic()
+            await self._sleep(TICK)
+
+    async def _sleep(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self._wake.wait(), seconds)
+        except asyncio.TimeoutError:
             pass
-    return tap_key("mute")
+        self._wake.clear()
 
 
 # --------------------------------------------------------------------------
-# web app
+# web server
 # --------------------------------------------------------------------------
-HERE = os.path.dirname(os.path.abspath(__file__))
-app = Flask(__name__, static_folder=None)
-app.config["TOKEN"] = None
+class Handler(BaseHTTPRequestHandler):
+    server_version = "webremote"
+    protocol_version = "HTTP/1.1"
+    remote: Remote  # set in main()
+    token: str | None = None
+    verbose = False
+
+    # -- plumbing ---------------------------------------------------------
+    def _send(self, status: int, body: bytes, content_type: str, cache: str = "no-store") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, data: dict, status: int = 200) -> None:
+        self._send(status, json.dumps(data).encode(), "application/json")
+
+    def _body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            data = json.loads(self.rfile.read(length) or b"{}")
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
+
+    def _allowed(self, query: dict) -> bool:
+        if not self.token:
+            return True
+        supplied = (query.get("t") or [None])[0] or self.headers.get("X-Token")
+        return bool(supplied) and secrets.compare_digest(supplied, self.token)
+
+    def log_message(self, fmt: str, *args) -> None:
+        if self.verbose:
+            super().log_message(fmt, *args)
+
+    def log_error(self, fmt: str, *args) -> None:
+        super().log_message(fmt, *args)
+
+    # -- routing ----------------------------------------------------------
+    def do_GET(self) -> None:
+        url = urlsplit(self.path)
+        if url.path == "/favicon.ico":
+            return self._send(204, b"", "image/x-icon")
+        if not self._allowed(parse_qs(url.query)):
+            return self._send(401, b"Missing or wrong access token.", "text/plain")
+
+        if url.path == "/":
+            page = (HERE / "static" / "index.html").read_bytes()
+            return self._send(200, page, "text/html; charset=utf-8")
+        if url.path == "/api/events":
+            return self._events()
+        if url.path == "/api/state":
+            try:
+                return self._json(self.remote.run(self.remote.snapshot, timeout=8))
+            except FutureTimeout:
+                return self._json({"error": "timed out"}, 504)
+        if url.path.startswith("/api/art/"):
+            found = art.get(url.path.rsplit("/", 1)[-1])
+            if found is None:
+                return self._send(404, b"", "text/plain")
+            return self._send(200, found[0], found[1], cache="max-age=86400, immutable")
+        self._send(404, b"Not found", "text/plain")
+
+    def do_POST(self) -> None:
+        url = urlsplit(self.path)
+        body = self._body()  # read it regardless, or it corrupts the next request on this connection
+        if not self._allowed(parse_qs(url.query)):
+            return self._json({"ok": False, "error": "unauthorised"}, 401)
+        remote = self.remote
+        try:
+            if url.path == "/api/command":
+                action = body.get("action")
+                if action not in ("playpause", "next", "prev"):
+                    return self._json({"ok": False, "error": "unknown action"}, 400)
+                via = remote.run(remote.media.command, action)
+                self._reply(via is not None, via=via)
+            elif url.path == "/api/seek":
+                position = float(body["position"])
+                self._reply(remote.run(remote.media.seek, position))
+            elif url.path == "/api/volume":
+                v = remote.volume
+                if "mute" in body:
+                    ok = remote.run(v.mute, body["mute"])
+                elif "delta" in body:
+                    ok = remote.run(v.nudge, float(body["delta"]))
+                elif "level" in body:
+                    ok = remote.run(v.set, float(body["level"]))
+                else:
+                    return self._json({"ok": False, "error": "nothing to do"}, 400)
+                self._reply(ok, volume=remote.run(v.get))
+            else:
+                self._json({"ok": False, "error": "not found"}, 404)
+        except (KeyError, TypeError, ValueError):
+            self._json({"ok": False, "error": "bad request"}, 400)
+        except FutureTimeout:
+            self._json({"ok": False, "error": "the media session did not answer in time"}, 504)
+        except Exception as exc:
+            self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+
+    def _reply(self, ok, **extra) -> None:
+        self.remote.refresh()
+        self._json({"ok": bool(ok), **extra})
+
+    def _events(self) -> None:
+        """Server-sent events: one JSON snapshot per change, for as long as
+        the page stays open."""
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        q = self.remote.subscribe()
+        try:
+            self.wfile.write(b"retry: 1500\n\n")
+            self.wfile.flush()
+            while True:
+                try:
+                    self.wfile.write(f"data: {q.get(timeout=15)}\n\n".encode())
+                except queue.Empty:
+                    self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+        except OSError:  # the page went away
+            pass
+        finally:
+            self.remote.unsubscribe(q)
 
 
-def protected(view):
-    @wraps(view)
-    def wrapper(*args, **kwargs):
-        token = app.config["TOKEN"]
-        if token:
-            supplied = request.args.get("t") or request.headers.get("X-Token")
-            if not supplied or not secrets.compare_digest(supplied, token):
-                abort(401)
-        return view(*args, **kwargs)
-
-    return wrapper
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
 
-@app.after_request
-def no_store(response):
-    response.headers.setdefault("Cache-Control", "no-store")
-    return response
-
-
-@app.get("/")
-@protected
-def index():
-    return send_from_directory(os.path.join(HERE, "static"), "index.html")
-
-
-TIMEOUT_STATE = {
-    "available": False,
-    "backend": "timeout",
-    "status": "closed",
-    "title": None,
-    "artist": None,
-    "album": None,
-    "app": None,
-    "position": None,
-    "duration": None,
-    "art": None,
-    "controls": {},
-    "error": "The Windows media session is not responding.",
-}
-
-
-HOLD_SECONDS = 10  # the watcher catches changes; this is only a heartbeat
-
-
-@app.get("/api/state")
-@protected
-def api_state():
-    # ?since=<version> holds the request until the watcher sees a change, so
-    # the page hears about it within a quarter second.
-    changes.last_wanted = time.monotonic()
-    since = request.args.get("since", type=int)
-    if since is not None and changes.live:
-        changes.wait(since, HOLD_SECONDS)
-    version = changes.version  # before reading, so a change mid-read is not lost
-
-    # A wedged media session must not take the whole page down: the phone is
-    # still talking to the PC, so answer 200 and say what is wrong.
-    try:
-        state = worker.call(read_state, timeout=4)
-    except FutureTimeout:
-        app.logger.warning("media session read timed out (apartment: %s)", worker.apartment)
-        state = dict(TIMEOUT_STATE)
-    try:
-        state["volume"] = worker.call(read_volume, timeout=4)
-        state["sessions"] = worker.call(_session_count, timeout=4)
-    except FutureTimeout:
-        state["volume"] = {"available": False, "level": None, "muted": None}
-    state["time"] = time.time()
-    state["version"] = version
-    state["live"] = changes.live
-    return jsonify(state)
-
-
-@app.post("/api/command")
-@protected
-def api_command():
-    action = (request.get_json(silent=True) or {}).get("action", "")
-    if action not in {"playpause", "play", "pause", "next", "prev", "stop"}:
-        return jsonify({"ok": False, "error": "unknown action"}), 400
-    try:
-        via = worker.call(do_command, action)
-        return jsonify({"ok": via is not None, "via": via})
-    except FutureTimeout:
-        app.logger.warning("%s command timed out (worker busy or media session stuck)", action)
-        return jsonify({"ok": False, "error": "timed out"})
-
-
-@app.post("/api/seek")
-@protected
-def api_seek():
-    body = request.get_json(silent=True) or {}
-    try:
-        position = float(body.get("position"))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "bad position"}), 400
-    try:
-        return jsonify({"ok": bool(worker.call(do_seek, position))})
-    except FutureTimeout:
-        return jsonify({"ok": False, "error": "timed out"})
-
-
-@app.post("/api/volume")
-@protected
-def api_volume():
-    body = request.get_json(silent=True) or {}
-    try:
-        if "mute" in body:
-            ok = worker.call(set_mute, body["mute"])
-        elif "delta" in body:
-            ok = worker.call(nudge_volume, float(body["delta"]))
-        elif "level" in body:
-            ok = worker.call(set_volume, float(body["level"]))
-        else:
-            return jsonify({"ok": False, "error": "nothing to do"}), 400
-        return jsonify({"ok": bool(ok), "volume": worker.call(read_volume, timeout=4)})
-    except FutureTimeout:
-        return jsonify({"ok": False, "error": "timed out"})
-
-
-@app.get("/api/sessions")
-@protected
-def api_sessions():
-    try:
-        return jsonify({"sessions": worker.call(list_sessions, timeout=10)})
-    except FutureTimeout:
-        return jsonify({"sessions": [], "error": "timed out"})
-
-
-@app.get("/api/art/<key>")
-@protected
-def api_art(key):
-    with _art_lock:
-        data = _art_cache.get(key)
-    if not data:
-        abort(404)
-    return app.response_class(data, mimetype="image/jpeg", headers={"Cache-Control": "max-age=3600"})
-
-
-class _QuietPolls(logging.Filter):
-    """Keep successful state polls out of the console without hiding errors."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        return not ("/api/state" in message and " 200 " in message)
-
-
-def local_ip() -> str:
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+def lan_address() -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.connect(("8.8.8.8", 80))
+        sock.connect(("10.255.255.255", 1))  # no packet is sent; this just picks a route
         return sock.getsockname()[0]
-    except Exception:
+    except OSError:
         return "127.0.0.1"
     finally:
         sock.close()
 
 
+def build(demo: bool, worker: Worker):
+    if demo:
+        return DemoMedia(), DemoVolume()
+    media = WindowsMedia() if MEDIA_BINDING else MediaKeysOnly()
+    volume = WindowsVolume() if VOLUME_ERROR is None else VolumeKeysOnly()
+    return media, volume
+
+
+def describe(media, volume) -> list[str]:
+    if isinstance(media, DemoMedia):
+        return ["media : demo player (nothing on this PC is controlled)"]
+    lines = []
+    if isinstance(media, WindowsMedia):
+        lines.append(f"media : Windows media session (via {MEDIA_BINDING})")
+    else:
+        lines.append("media : media keys only - no track info or seeking"
+                     if IS_WINDOWS else "media : unavailable - not Windows (try --demo)")
+        lines += [f"        tried {err}" for err in MEDIA_ERRORS]
+    if isinstance(volume, WindowsVolume):
+        lines.append("volume: system master volume (via pycaw)")
+    else:
+        lines.append("volume: volume keys only - no slider" if IS_WINDOWS else "volume: unavailable")
+        lines.append(f"        tried pycaw: {VOLUME_ERROR}")
+    return lines
+
+
+def check(remote: Remote) -> int:
+    """Exercise every backend for real; an import succeeding proves little."""
+    print(f"python: {sys.version.split()[0]} on {sys.platform}, worker in {remote.worker.apartment}")
+    for line in describe(remote.media, remote.volume):
+        print(line)
+    ok = isinstance(remote.media, WindowsMedia) and isinstance(remote.volume, WindowsVolume)
+
+    if isinstance(remote.media, WindowsMedia):
+        try:
+            rows = remote.run(remote.media.sessions, timeout=10)
+            print(f"        {len(rows)} session(s) registered")
+            for row in rows:
+                mark = "*" if row["current"] else " "
+                print(f"      {mark} {row['app']}  [{row['status']}]  supports: "
+                      f"{', '.join(row['supports']) or 'nothing'}")
+            state = remote.run(remote.media.state, timeout=10)
+            if state["active"]:
+                print(f"        showing: {state['app']} - {state['title'] or 'untitled'} "
+                      f"[{state['status']}], seek {'yes' if state['can']['seek'] else 'no'}")
+        except Exception as exc:
+            ok = False
+            print(f"        FAILED: {type(exc).__name__}: {exc}")
+
+    if isinstance(remote.volume, WindowsVolume):
+        vol = remote.run(remote.volume.get)
+        if vol["available"]:
+            print(f"        reading: {vol['level']}%{' (muted)' if vol['muted'] else ''}")
+        else:
+            ok = False
+            print(f"        FAILED: {vol['error']}")
+    return 0 if ok else 1
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--host", default="0.0.0.0", help="interface to bind (default: all)")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--host", default="0.0.0.0", help="address to listen on (default: all)")
     parser.add_argument("--port", type=int, default=8765, help="port (default: 8765)")
-    parser.add_argument("--token", nargs="?", const="generate", default=None,
-                        help="require ?t=TOKEN; pass the flag alone to generate one")
-    parser.add_argument("--media-keys", action="store_true",
-                        help="always drive playback with virtual media keys instead of "
-                             "the media session; for apps whose session ignores commands")
+    parser.add_argument("--token", nargs="?", const="", metavar="TOKEN",
+                        help="require ?t=TOKEN in the URL; give the flag alone to generate one")
+    parser.add_argument("--demo", action="store_true", help="use a simulated player")
     parser.add_argument("--check", action="store_true",
-                        help="report what this environment supports and exit; "
-                             "exit code 0 = full features, 1 = media keys only")
+                        help="report what works here and exit (0 = everything)")
+    parser.add_argument("--verbose", action="store_true", help="log every request")
     args = parser.parse_args()
 
-    global FORCE_MEDIA_KEYS
-    FORCE_MEDIA_KEYS = args.media_keys
-
-    media_note = f"Windows media session (via {BINDING})" if HAVE_WINRT else \
-        "media keys only - no track info (see README: 'No wheel for your Python')"
-    volume_note = "system master volume" if HAVE_PYCAW else "media keys only (pycaw not installed)"
-
+    worker = Worker()
+    remote = Remote(*build(args.demo, worker), worker)
     if args.check:
-        # Actually call both backends. Importing a package proves nothing about
-        # whether it works, which is how the last two faults stayed invisible.
-        print(f"  python: {sys.version.split()[0]} on {sys.platform}")
-        print(f"  com   : {worker.apartment} apartment")
+        return check(remote)
 
-        print(f"  media : {media_note}")
-        for line in BINDING_ERRORS:
-            print(f"          tried {line}")
-        if not HAVE_WINRT and IS_WINDOWS:
-            print(f"          fix:   {MEDIA_FIX}")
+    if args.token == "":
+        args.token = secrets.token_urlsafe(6)
+    Handler.remote, Handler.token, Handler.verbose = remote, args.token, args.verbose
 
-        media_ok = HAVE_WINRT
-        if HAVE_WINRT:
-            try:
-                state = worker.call(read_state, timeout=10)
-                rows = worker.call(list_sessions, timeout=15)
-                print(f"          {len(rows)} media session(s) registered")
-                for row in rows:
-                    flags = "".join(k[0] if v else "-" for k, v in sorted(row["controls"].items()))
-                    marker = "*" if row["current"] else " "
-                    title = row["title"] or "no title"
-                    print(f'         {marker} {row["app"]}  [{row["status"]}] '
-                          f'{flags}  dur={row["duration"]}  "{title}"')
-                if rows:
-                    print("           * = the session Windows calls current; flags are")
-                    print("             next/pause/play/prev/seek, letter = supported")
-                if state["available"]:
-                    who = state["app"] or "unknown app"
-                    what = state["title"] or "no title reported"
-                    print(f'          reading: {who} - "{what}" [{state["status"]}]')
-                else:
-                    print("          no app is currently registered as playing media")
-                started = time.monotonic()
-                worker.call(_fingerprint, timeout=10)
-                took = (time.monotonic() - started) * 1000
-                print(f"          change check: {took:.0f} ms (runs every {WATCH_INTERVAL * 1000:.0f} ms)")
-            except Exception as exc:
-                media_ok = False
-                print(f"          FAILED: {type(exc).__name__}: {exc}")
+    try:
+        server = Server((args.host, args.port), Handler)
+    except OSError as exc:
+        print(f"Cannot listen on port {args.port}: {exc}. Try --port with another number.")
+        return 1
 
-        print(f"  volume: {volume_note}")
-        if PYCAW_ERROR:
-            print(f"          tried pycaw: {PYCAW_ERROR}")
-            if IS_WINDOWS:
-                print(f"          fix:   {VOLUME_FIX}")
-
-        volume_ok = False
-        try:
-            vol = worker.call(read_volume, timeout=10)
-            volume_ok = vol["available"]
-            if volume_ok:
-                print(f"          reading: {vol['level']}%, muted={vol['muted']}")
-            elif vol.get("error"):
-                print(f"          FAILED: {vol['error']}")
-        except Exception as exc:
-            print(f"          FAILED: {type(exc).__name__}: {exc}")
-
-        return 0 if (media_ok and volume_ok) else 1
-
-    if args.token == "generate":
-        args.token = secrets.token_urlsafe(8)
-    app.config["TOKEN"] = args.token
-
-    suffix = f"?t={args.token}" if args.token else ""
-    start_watching()
-
+    suffix = f"/?t={args.token}" if args.token else "/"
     print("webremote")
-    print(f"  media : {media_note}")
-    print(f"  volume: {volume_note}")
-    print(f"  com   : {worker.apartment} apartment")
+    for line in describe(remote.media, remote.volume):
+        print(f"  {line}")
     print()
-    print(f"  local : http://127.0.0.1:{args.port}/{suffix}")
-    print(f"  phone : http://{local_ip()}:{args.port}/{suffix}")
+    print(f"  on this PC : http://127.0.0.1:{args.port}{suffix}")
+    print(f"  on a phone : http://{lan_address()}:{args.port}{suffix}")
     print()
     print("  Ctrl+C to stop.")
-    logging.getLogger("werkzeug").addFilter(_QuietPolls())
-
-    app.run(host=args.host, port=args.port, threaded=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
     return 0
 
 
